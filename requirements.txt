@@ -1,0 +1,9 @@
+python-dotenv
+pandas
+openpyxl
+google-cloud-storage
+google-cloud-pubsub
+google-cloud-bigquery
+google-cloud-aiplatform
+vertexai
+openai
