@@ -18,7 +18,7 @@ import tempfile
 import traceback
 # +++ MODIFICATION START +++
 # Import typing for better type hints
-from typing import Dict, Union
+from typing import Dict, Union, List, Optional, Any # Added Optional, Any, List
 # +++ MODIFICATION END +++
 
 
@@ -935,182 +935,134 @@ def load_to_bq(df: pd.DataFrame, table_id: str, schema_list: list, write_disposi
 
 # +++ MODIFICATION START +++
 # Modified process_object to handle multiple sheets from Excel
-def process_object(object_name: str):
-    """Processes a GCS object: reads data, cleans, determines schema, aligns, and loads to BigQuery."""
-    logger_worker.info(f"--- Starting processing GCS object: {object_name} ---")
-    all_sheets_successful = True # Flag to track if all sheets processed ok
+def process_object(object_name: str, target_dataset_id: str): # Added target_dataset_id parameter
+    """Processes a GCS object: reads, cleans, determines schema, aligns, and loads to the target BigQuery dataset."""
+    logger_worker.info(f"--- Starting processing GCS object: {object_name} -> Target BQ Dataset: {target_dataset_id} ---")
+    all_sheets_successful = True
+
+    # Validate target_dataset_id format (basic example)
+    if not re.match(r"^[a-zA-Z0-9_]+$", target_dataset_id):
+         logger_worker.error(f"Invalid target_dataset_id format received: '{target_dataset_id}'. Aborting processing.")
+         raise ValueError(f"Invalid target dataset ID format: {target_dataset_id}")
 
     try:
         # --- 1. Read Data ---
-        # read_data_from_gcs now returns Dict[str, pd.DataFrame] for Excel, pd.DataFrame for others
+        # Reads from the MANAGED bucket using the full object name provided
         raw_data = read_data_from_gcs(WORKER_GCS_BUCKET, object_name)
-
-        # Handle read failures or file not found
-        if raw_data is None:
-            # read_data_from_gcs already logged the error
-            raise ValueError(f"Failed to read data from GCS object: {object_name}")
+        if raw_data is None: raise ValueError(f"Failed to read data from GCS object: {object_name}")
 
         # --- 2. Prepare Data Structure for Processing ---
-        # Standardize to a dictionary {sheet_name: dataframe} format
         sheets_to_process: Dict[str, pd.DataFrame] = {}
-        if isinstance(raw_data, pd.DataFrame):
-            # For CSV/Parquet, use a default key
-            logger_worker.info(f"Read single DataFrame (CSV/Parquet). Processing as default sheet.")
-            sheets_to_process["_default_"] = raw_data
-        elif isinstance(raw_data, dict):
-            # For Excel, use the dictionary directly
-            logger_worker.info(f"Read {len(raw_data)} sheets from Excel file.")
-            sheets_to_process = raw_data
-        else:
-            # Should not happen based on read_data_from_gcs return types
-            raise TypeError(f"Unexpected data type returned from read_data_from_gcs: {type(raw_data)}")
+        if isinstance(raw_data, pd.DataFrame): sheets_to_process["_default_"] = raw_data; logger_worker.info(f"Read single DataFrame (CSV/Parquet). Processing as default sheet.")
+        elif isinstance(raw_data, dict): sheets_to_process = raw_data; logger_worker.info(f"Read {len(raw_data)} sheets from Excel file.")
+        else: raise TypeError(f"Unexpected data type returned from read_data_from_gcs: {type(raw_data)}")
 
         # --- 3. Process Each Sheet ---
+        # Extract base filename from the *last part* of the object_name
         base_filename = sanitize_bq_name(os.path.splitext(os.path.basename(object_name))[0])
         processed_sheet_count = 0
 
-        if not sheets_to_process:
-             logger_worker.warning(f"No sheets found or read from {object_name}. Skipping further processing.")
-             # If the file was read but contained no sheets (e.g., empty excel), this is technically success.
-             # If read failed earlier, raw_data would be None and error raised.
-             # Consider if this state should ACK or NACK. Let's ACK as the file was processed (found empty).
-             return # Exit processing for this object
+        if not sheets_to_process: logger_worker.warning(f"No sheets found or read from {object_name}. Skipping."); return
 
         for sheet_name, raw_sheet_df in sheets_to_process.items():
             logger_worker.info(f"--- Processing sheet: '{sheet_name}' ---")
             try:
-                if raw_sheet_df is None or raw_sheet_df.empty:
-                    logger_worker.warning(f"Sheet '{sheet_name}' is empty or None after initial read. Skipping.")
-                    continue
-
-                # a. Isolate data block for the current sheet
+                if raw_sheet_df is None or raw_sheet_df.empty: logger_worker.warning(f"Sheet '{sheet_name}' is empty or None. Skipping."); continue
                 isolated_df = _isolate_data_block(raw_sheet_df)
-                if isolated_df.empty:
-                    logger_worker.warning(f"No data block found in sheet '{sheet_name}' after isolation. Skipping.")
-                    continue
-
-                # b. Clean the isolated data block (includes header promotion, sanitization)
+                if isolated_df.empty: logger_worker.warning(f"No data block found in sheet '{sheet_name}'. Skipping."); continue
                 cleaned_df = clean_dataframe(isolated_df)
-                if cleaned_df.empty:
-                    logger_worker.warning(f"Sheet '{sheet_name}' is empty after cleaning. Skipping.")
-                    continue
+                if cleaned_df.empty: logger_worker.warning(f"Sheet '{sheet_name}' is empty after cleaning. Skipping."); continue
 
-                # c. Determine target BigQuery table name
-                # Sanitize sheet name separately
+                # c. Determine target BigQuery table name (using base_filename and sheet_name)
                 sanitized_sheet_name = sanitize_bq_name(sheet_name)
-                # Combine base filename and sheet name (avoid double underscore if sheet is default)
-                # Limit total length
-                if sheet_name == "_default_":
-                    target_table_name = base_filename
-                else:
-                    # Truncate intelligently if combined name is too long
-                    max_len = 1024 # BQ limit
-                    available_len = max_len - len(base_filename) - 1 # Account for underscore
-                    if available_len < 1: # Base filename itself is too long
-                         target_table_name = base_filename[:max_len]
-                         logger_worker.warning(f"Base filename '{base_filename}' too long, truncated to {max_len} chars.")
-                    else:
-                        truncated_sheet_name = sanitized_sheet_name[:available_len]
-                        target_table_name = f"{base_filename}_{truncated_sheet_name}"
-                        if len(truncated_sheet_name) < len(sanitized_sheet_name):
-                            logger_worker.warning(f"Combined table name too long. Sheet name '{sanitized_sheet_name}' truncated to '{truncated_sheet_name}'.")
+                target_table_name = base_filename if sheet_name == "_default_" else f"{base_filename}_{sanitized_sheet_name}"
+                # Ensure combined name doesn't exceed BQ limits (1024 chars)
+                target_table_name = target_table_name[:1024]
 
-                table_id = f"{WORKER_GCP_PROJECT}.{WORKER_BQ_DATASET}.{target_table_name}"
+                # --- MODIFIED: Construct full table ID using the DYNAMIC dataset ID ---
+                table_id = f"{WORKER_GCP_PROJECT}.{target_dataset_id}.{target_table_name}"
                 logger_worker.info(f"Target BQ table for sheet '{sheet_name}': {table_id}")
 
-                # d. Determine schema for this sheet's data
+                # d. Determine schema for this sheet's data (using the full dynamic table_id)
                 schema = determine_schema(cleaned_df, table_id, WORKER_DEFAULT_SCHEMA_STRATEGY)
-                if schema is None:
-                    # Log error but continue to next sheet if possible
-                    logger_worker.error(f"Schema determination failed for sheet '{sheet_name}' (table: {table_id}). Skipping this sheet.")
-                    all_sheets_successful = False # Mark overall process as partially failed
-                    continue # Move to the next sheet
+                if schema is None: logger_worker.error(f"Schema determination failed for sheet '{sheet_name}' (table: {table_id}). Skipping sheet."); all_sheets_successful = False; continue
 
                 # e. Align DataFrame to the determined schema
-                # Pass a copy to align_dataframe_to_schema to avoid modifying cleaned_df used elsewhere potentially
                 aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema)
-                if aligned_df.empty and not cleaned_df.empty:
-                    # This indicates alignment process removed all rows/columns, likely a major schema mismatch
-                    logger_worker.error(f"DataFrame for sheet '{sheet_name}' became empty during schema alignment for table {table_id}. Check schema and data compatibility. Skipping this sheet.")
-                    all_sheets_successful = False
-                    continue
-                elif aligned_df.empty:
-                     # This means cleaned_df was already empty, warning issued earlier
-                     logger_worker.warning(f"Aligned DataFrame for sheet '{sheet_name}' is empty (likely empty after cleaning). Skipping load for {table_id}.")
-                     continue
+                if aligned_df.empty: logger_worker.warning(f"Aligned DataFrame for sheet '{sheet_name}' is empty (table: {table_id}). Skipping load."); continue # Skip if empty
 
-                # f. Load the aligned data to BigQuery
+                # f. Load the aligned data to BigQuery (using the full dynamic table_id)
                 load_to_bq(aligned_df, table_id, schema, WORKER_DEFAULT_WRITE_DISPOSITION)
 
                 logger_worker.info(f"--- Successfully processed sheet: '{sheet_name}' -> {table_id} ---")
                 processed_sheet_count += 1
 
             except Exception as sheet_error:
-                logger_worker.error(f"--- Error processing sheet: '{sheet_name}' for object {object_name}: {sheet_error} ---", exc_info=True)
+                logger_worker.error(f"--- Error processing sheet: '{sheet_name}' for object {object_name} -> {target_dataset_id}: {sheet_error} ---", exc_info=True)
                 all_sheets_successful = False # Mark overall process as partially failed
-                # Continue to the next sheet
 
         # --- 4. Final Logging for the Object ---
-        if processed_sheet_count > 0 and all_sheets_successful:
-             logger_worker.info(f"--- Successfully processed all {processed_sheet_count} sheet(s) for GCS object: {object_name} ---")
-        elif processed_sheet_count > 0 and not all_sheets_successful:
-             logger_worker.warning(f"--- Partially processed GCS object: {object_name}. {processed_sheet_count} sheet(s) loaded, but errors occurred on others. See logs. ---")
-             # We still ACK the message as *some* work was done. Errors are logged.
-        elif processed_sheet_count == 0 and not sheets_to_process:
-             # This case was handled earlier (empty file/no sheets)
-             logger_worker.info(f"--- Finished processing object {object_name}: No sheets found or read. ---")
-        elif processed_sheet_count == 0 and all_sheets_successful: # sheets_to_process had sheets, but all were skipped (e.g., empty after clean)
-             logger_worker.warning(f"--- Finished processing object {object_name}: All sheets were skipped (e.g., empty). No data loaded. ---")
+        if processed_sheet_count > 0 and all_sheets_successful: logger_worker.info(f"--- Successfully processed all {processed_sheet_count} sheet(s) for GCS object: {object_name} -> {target_dataset_id} ---")
+        elif processed_sheet_count > 0 and not all_sheets_successful: logger_worker.warning(f"--- Partially processed GCS object: {object_name} -> {target_dataset_id}. {processed_sheet_count} sheet(s) loaded, errors on others. See logs. ---")
+        elif processed_sheet_count == 0 and not sheets_to_process: logger_worker.info(f"--- Finished object {object_name}: No sheets found. ---")
+        elif processed_sheet_count == 0 and all_sheets_successful: logger_worker.warning(f"--- Finished object {object_name}: All sheets skipped (e.g., empty). No data loaded to {target_dataset_id}. ---")
         else: # processed_sheet_count == 0 and not all_sheets_successful
-             logger_worker.error(f"--- Failed to process any sheets successfully for GCS object: {object_name}. See errors above. ---")
-             # If absolutely no sheet succeeded, perhaps raise an error to NACK?
-             # For now, let's stick to ACK if the initial read worked but sheets failed individually.
-             # If the initial read failed, the error is raised before this point.
-             # Let's raise to NACK if ZERO sheets were successfully processed but there were sheets initially
-             if sheets_to_process and processed_sheet_count == 0:
-                  raise Exception(f"Failed to process any sheet successfully for {object_name}")
-
+             logger_worker.error(f"--- Failed to process any sheets successfully for GCS object: {object_name} -> {target_dataset_id}. See errors. ---")
+             if sheets_to_process and processed_sheet_count == 0: raise Exception(f"Failed to process any sheet successfully for {object_name}")
 
     except FileNotFoundError:
-        # This error is re-raised from read_data_from_gcs
-        logger_worker.warning(f"GCS object not found: '{object_name}'. Message should be ACKed as the object doesn't exist.")
-        # Do not re-raise here, allow callback to ACK
-        return # Explicitly return to signal successful handling (of a non-existent file)
+        logger_worker.warning(f"GCS object not found: '{object_name}'. Cannot process. Allowing ACK.")
+        return # Do not re-raise, allow callback to ACK
     except Exception as e:
-        logger_worker.error(f"--- Critical error during processing of GCS object {object_name}: {type(e).__name__} - {e} ---", exc_info=True)
-        raise # Re-raise the exception to be caught by the callback for NACKing
+        logger_worker.error(f"--- Critical error during processing of GCS object {object_name} for dataset {target_dataset_id}: {type(e).__name__} - {e} ---", exc_info=True)
+        raise # Re-raise exception for NACKing
 
 # +++ MODIFICATION END +++
 
 # callback function remains UNCHANGED
 def callback(message):
-    """Callback function for Pub/Sub message processing."""
-    object_name = None # Initialize object_name
+    """Callback function for Pub/Sub message processing. Expects JSON payload."""
+    object_name = None
+    target_dataset_id = None
+    raw_message_data = message.data
 
     try:
-        # 1. Decode message data
-        object_name = message.data.decode("utf-8")
-        logger_worker.info(f"Received Pub/Sub message, processing GCS object: {object_name}")
+        # 1. Decode and Parse JSON message data
+        message_str = raw_message_data.decode("utf-8")
+        logger_worker.debug(f"Received raw Pub/Sub message data: {message_str}")
+        message_data = json.loads(message_str)
 
-        # 2. Process the object
-        process_object(object_name) # This function now handles internal errors/sheet skipping
+        # Extract required fields
+        object_name = message_data.get("object_name")
+        target_dataset_id = message_data.get("target_dataset_id")
 
-        # 3. Acknowledge the message if process_object completes
-        #    without raising an exception (FileNotFound is handled inside process_object)
+        if not object_name or not target_dataset_id:
+            logger_worker.error(f"Invalid Pub/Sub message format: Missing 'object_name' or 'target_dataset_id'. Data: {message_str}")
+            message.nack() # NACK invalid format messages
+            return
+
+        logger_worker.info(f"Received Pub/Sub message, processing GCS object: {object_name} for BQ Dataset: {target_dataset_id}")
+
+        # 2. Process the object using extracted info
+        process_object(object_name, target_dataset_id)
+
+        # 3. Acknowledge the message if process_object completes successfully
+        #    (FileNotFound is handled inside process_object and doesn't raise here)
         message.ack()
-        logger_worker.info(f"Successfully processed and ACKed message for: {object_name}")
+        logger_worker.info(f"Successfully processed and ACKed message for: {object_name} -> {target_dataset_id}")
 
+    except json.JSONDecodeError as json_err:
+        logger_worker.error(f"Failed to parse Pub/Sub message JSON: {json_err}. Raw Data: '{raw_message_data.decode('utf-8', errors='replace')}'")
+        message.nack() # NACK messages that are not valid JSON
     except FileNotFoundError as fnf_err:
-         # This case should now be handled within process_object, but catch just in case
+         # Should be handled by process_object, but double-check
          logger_worker.warning(f"File not found during processing: {fnf_err}. Acknowledging message.")
-         message.ack() # ACK if file not found, as it cannot be processed
+         message.ack() # ACK if file not found
     except Exception as e:
-        # Catch all other exceptions raised from process_object or decoding
-        logger_worker.exception(f"CRITICAL error processing message for GCS object '{object_name or 'UNKNOWN'}': {e}")
-        # Negative acknowledge the message so Pub/Sub can retry (or send to DLQ)
-        message.nack()
+        # Catch all other exceptions raised from process_object or JSON parsing/validation
+        logger_worker.exception(f"CRITICAL error processing message for GCS object '{object_name or 'UNKNOWN'}' -> Dataset '{target_dataset_id or 'UNKNOWN'}': {e}")
+        message.nack() # NACK on processing errors
         logger_worker.info(f"NACKed message for: {object_name or 'UNKNOWN'}")
-
 
 # Main execution block remains UNCHANGED
 if __name__ == "__main__":
