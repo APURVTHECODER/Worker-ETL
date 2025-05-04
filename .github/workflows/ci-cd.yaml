@@ -92,7 +92,7 @@ jobs:
         with:
           repository: ${{ env.BACKEND_REPO }}
           token: ${{ secrets.CROSS_REPO_ACCESS_TOKEN }}
-          ref: base64
+          ref: risk
           path: Backend-ETL
 
       # --- Authentication and GKE setup ---
