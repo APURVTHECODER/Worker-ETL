@@ -1,0 +1,144 @@
+name: Worker CI/CD
+
+on:
+  push:
+    branches: [ "*" ] # Trigger on push to ANY branch
+  pull_request:
+    branches: [ "*" ] # Trigger on PRs to ANY branch
+    
+env:
+  GCP_PROJECT_ID: crafty-tracker-457215-g6
+  GAR_LOCATION: us-central1
+  APP_REPO_NAME: app-images
+  GKE_CLUSTER_NAME: cluster-1  # <<< VERIFY THIS NAME
+  GKE_ZONE: us-central1-a        # <<< VERIFY THIS ZONE
+  # --- Make sure these match your WIF setup EXACTLY ---
+  GCP_WORKLOAD_IDENTITY_PROVIDER: 'projects/1076741205751/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider'
+  GCP_SERVICE_ACCOUNT: 'github-actions-deployer@crafty-tracker-457215-g6.iam.gserviceaccount.com'
+  # --- Make sure this points to the repo containing k8s manifests ---
+  BACKEND_REPO: APURVTHECODER/Backend-ETL
+
+jobs:
+  test:
+    name: Run Worker Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Worker Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        # Assumes requirements.txt is at the root of worker repo
+        run: pip install -r requirements.txt
+
+      - name: Run Tests # Replace with your actual test command
+        run: echo "Running worker tests... (Update this step!)" # Placeholder
+
+  build-and-push:
+    name: Build and Push Worker Image
+    needs: test
+    runs-on: ubuntu-latest
+    # --- MODIFIED: Removed 'if' condition ---
+    # This job will now run on pushes/PRs to ANY branch AFTER tests pass
+    # if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: 'read'
+      id-token: 'write' # Needed for WIF
+    steps:
+      - name: Checkout Worker Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: 'google-github-actions/auth@v2'
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK & Docker Helper
+        uses: 'google-github-actions/setup-gcloud@v2'
+      - run: gcloud auth configure-docker ${{ env.GAR_LOCATION }}-docker.pkg.dev --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: . # Build context is root of worker repo
+          push: true # Push the image
+          # Tags image with commit SHA for pushes, maybe uses default for PRs
+          tags: ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.APP_REPO_NAME }}/worker:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy Worker to GKE
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    # --- MODIFIED: Removed 'if' condition ---
+    # This job will now run on pushes/PRs to ANY branch AFTER build passes
+    # if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: 'read' # To checkout backend repo
+      id-token: 'write' # For WIF
+    steps:
+      # Checkout Backend Repo for k8s manifests
+      - name: Checkout Backend Repo (for k8s manifests)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BACKEND_REPO }}
+          token: ${{ secrets.CROSS_REPO_ACCESS_TOKEN }}
+          ref: base64
+          path: Backend-ETL
+
+      # --- Authentication and GKE setup ---
+      - name: Authenticate to Google Cloud
+        uses: 'google-github-actions/auth@v2'
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+      - name: Set up Cloud SDK & Kubectl
+        uses: 'google-github-actions/setup-gcloud@v2'
+      - run: gcloud components install gke-gcloud-auth-plugin --quiet
+      - name: Get GKE Credentials
+        run: gcloud container clusters get-credentials ${{ env.GKE_CLUSTER_NAME }} --zone ${{ env.GKE_ZONE }} --project ${{ env.GCP_PROJECT_ID }}
+
+      # --- Secrets/ConfigMaps: Assumes backend workflow handles these ---
+      # If worker needs specific secrets NOT created by backend, add steps here
+
+      # --- Substitute Worker Image Tag ---
+      - name: Substitute Worker Image Tag
+        run: |
+          IMAGE_TAG=${{ github.sha }} # Use SHA from the worker repo commit
+          # IMPORTANT: Verify this path is correct within the Backend-ETL repo structure
+          MANIFEST_FILE=Backend-ETL/backend/k8s/worker-deployment.yaml
+          echo "Substituting IMAGE_TAG in $MANIFEST_FILE with $IMAGE_TAG"
+          # Using | as delimiter for sed
+          sed -i "s|\${GAR_LOCATION}-docker.pkg.dev/\${GCP_PROJECT_ID}/\${APP_REPO_NAME}/worker:\${IMAGE_TAG}|${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.APP_REPO_NAME }}/worker:${IMAGE_TAG}|g" "$MANIFEST_FILE"
+          if [ $? -ne 0 ]; then echo "Error substituting image tag!"; exit 1; fi
+          echo "Substitution check:"
+          grep "image:" "$MANIFEST_FILE" || echo "Image line not found after substitution?"
+
+
+      # --- Apply ALL manifests from backend repo ---
+      - name: Apply Kubernetes Manifests
+        run: |
+          # IMPORTANT: Verify this path is correct within the Backend-ETL repo structure
+          K8S_PATH="Backend-ETL/backend/k8s"
+          echo "Applying all manifests from $K8S_PATH"
+          kubectl apply -f $K8S_PATH/
+          if [ $? -ne 0 ]; then echo "Error applying manifests!"; exit 1; fi
+          echo "Manifests applied."
+
+      # Optional: Wait for Worker Rollout
+      - name: Wait for Worker Rollout
+        # Only run this if the worker deployment is critical path and you want to ensure it's stable
+        run: |
+          echo "Waiting for worker deployment rollout..."
+          kubectl rollout status deployment/worker-deployment --timeout=3m # Shorter timeout maybe okay
+          if [ $? -ne 0 ]; then echo "Error waiting for worker rollout!"; exit 1; fi
+          echo "Worker rollout complete."

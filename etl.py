@@ -8,6 +8,9 @@ import re
 import logging
 import pandas as pd
 import requests
+import base64
+import atexit
+from google.oauth2 import service_account
 from dotenv import load_dotenv
 from google.cloud import storage, bigquery
 from google.cloud.pubsub_v1 import SubscriberClient
@@ -46,7 +49,7 @@ WORKER_GCS_BUCKET = os.getenv("GCS_BUCKET")
 WORKER_BQ_DATASET = os.getenv("BQ_DATASET")
 WORKER_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None)
 WORKER_PUBSUB_SUBSCRIPTION = os.getenv("PUBSUB_SUBSCRIPTION")
-WORKER_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service-account.json") # Default filename
+# WORKER_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service-account.json") # Default filename
 
 WORKER_DEFAULT_SCHEMA_STRATEGY = os.getenv("SCHEMA_STRATEGY", "existing_or_gemini")
 WORKER_DEFAULT_WRITE_DISPOSITION = os.getenv("BQ_WRITE_DISPOSITION", "WRITE_APPEND")
@@ -65,21 +68,125 @@ missing_vars = [k for k, v in required_vars.items() if not v]
 if missing_vars:
     error_msg = f"Worker Error: Missing required environment variables: {', '.join(missing_vars)}."
     logger_worker.critical(error_msg); raise ValueError(error_msg)
-if not os.path.exists(WORKER_CREDENTIALS_PATH):
-     error_msg = f"Worker Creds file not found: {WORKER_CREDENTIALS_PATH}"
-     logger_worker.critical(error_msg); raise FileNotFoundError(error_msg)
+# if not os.path.exists(WORKER_CREDENTIALS_PATH):
+#      error_msg = f"Worker Creds file not found: {WORKER_CREDENTIALS_PATH}"
+#      logger_worker.critical(error_msg); raise FileNotFoundError(error_msg)
 if "gemini" in WORKER_DEFAULT_SCHEMA_STRATEGY and not WORKER_GEMINI_API_KEY:
      logger_worker.warning("SCHEMA_STRATEGY uses Gemini, but GEMINI_API_KEY not set.")
 
 # --- Initialize Worker Clients (Keep as before) ---
-try:
-    worker_creds = service_account.Credentials.from_service_account_file(WORKER_CREDENTIALS_PATH)
-    worker_storage_client = storage.Client(credentials=worker_creds, project=WORKER_GCP_PROJECT)
-    worker_bq_client = bigquery.Client(credentials=worker_creds, project=WORKER_GCP_PROJECT)
-    worker_subscriber = SubscriberClient(credentials=worker_creds) # Add retry/timeout config?
-    logger_worker.info(f"Worker Clients initialized. Project: {WORKER_GCP_PROJECT}, Sub: {WORKER_PUBSUB_SUBSCRIPTION}")
-except Exception as e: logger_worker.critical(f"Worker Client Init Failed: {e}", exc_info=True); worker_storage_client = worker_bq_client = worker_subscriber = None; raise
+_worker_temp_cred_file_path: Optional[str] = None # For cleanup
 
+# --- Cleanup function for temporary credentials file ---
+def _cleanup_worker_temp_file():
+    """Removes the temporary credentials file if it was created."""
+    global _worker_temp_cred_file_path
+    if _worker_temp_cred_file_path and os.path.exists(_worker_temp_cred_file_path):
+        try:
+            os.remove(_worker_temp_cred_file_path)
+            logger_worker.info(f"Cleaned up worker temporary credentials file: {_worker_temp_cred_file_path}")
+            _worker_temp_cred_file_path = None
+        except Exception as e:
+            logger_worker.warning(f"Could not remove worker temp credentials file {_worker_temp_cred_file_path}: {e}")
+
+# --- Initialize Worker Clients ---
+worker_storage_client: Optional[storage.Client] = None
+worker_bq_client: Optional[bigquery.Client] = None
+worker_subscriber: Optional[SubscriberClient] = None
+
+try: # Top Level Try for overall initialization logic
+    logger_worker.info("Initializing Worker GCP Clients...")
+    gcp_project_id = WORKER_GCP_PROJECT
+    # Read the environment variable expecting Base64 content
+    encoded_key_content = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+    # --- Step 1: Prepare Credentials Environment ---
+    if encoded_key_content:
+        logger_worker.info("Attempting to decode/write Base64 GOOGLE_APPLICATION_CREDENTIALS for worker...")
+        try:
+            decoded_bytes = base64.b64decode(encoded_key_content)
+            key_info = json.loads(decoded_bytes.decode('utf-8'))
+            logger_worker.info("Successfully decoded/parsed worker credentials.")
+
+            # Write to temporary file
+            try:
+                 with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
+                     json.dump(key_info, temp_file)
+                     _worker_temp_cred_file_path = temp_file.name
+                 logger_worker.info(f"Worker credentials written to temp file: {_worker_temp_cred_file_path}")
+                 # Set environment variable for libraries to find it
+                 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = _worker_temp_cred_file_path
+                 logger_worker.info(f"Set GOOGLE_APPLICATION_CREDENTIALS env var to: {_worker_temp_cred_file_path}")
+                 # Register cleanup only if successful
+                 atexit.register(_cleanup_worker_temp_file)
+
+            except Exception as file_err:
+                 logger_worker.error(f"Failed to write worker credentials to temp file: {file_err}", exc_info=True)
+                 _worker_temp_cred_file_path = None
+                 os.environ.pop('GOOGLE_APPLICATION_CREDENTIALS', None) # Unset if write failed
+                 # Let client init fail below if ADC isn't configured on the worker instance
+
+        except Exception as decode_err:
+            logger_worker.error(f"Failed to decode/parse worker Base64 credentials: {decode_err}. Check GOOGLE_APPLICATION_CREDENTIALS env var.", exc_info=True)
+            _worker_temp_cred_file_path = None
+            os.environ.pop('GOOGLE_APPLICATION_CREDENTIALS', None) # Unset invalid value
+            # Let client init fail below if ADC isn't configured
+
+    elif gcp_project_id:
+         logger_worker.info("Worker GOOGLE_APPLICATION_CREDENTIALS not set. Relying on Application Default Credentials (ADC)...")
+         # Ensure env var is unset if we expect ADC
+         os.environ.pop('GOOGLE_APPLICATION_CREDENTIALS', None)
+    else:
+        # Critical failure if no credentials AND no project ID for ADC
+        error_msg = "Worker cannot initialize clients: Set GCP_PROJECT env var, or provide valid Base64 credentials in GOOGLE_APPLICATION_CREDENTIALS."
+        logger_worker.critical(error_msg)
+        raise ValueError(error_msg)
+
+
+    # --- Step 2: Initialize Clients ---
+    # They will use the temp file path set in ENV or ADC
+    auth_method = "temp key file" if _worker_temp_cred_file_path else "ADC"
+    logger_worker.info(f"Initializing clients using {auth_method}...")
+
+    # Check project ID again, crucial for client initialization
+    if not gcp_project_id:
+        raise ValueError("Worker cannot initialize clients: GCP_PROJECT is None after credential setup.")
+
+    initialization_failed = False
+    try:
+        worker_storage_client = storage.Client(project=gcp_project_id)
+        logger_worker.info("Storage Client Initialized OK.")
+    except Exception as e:
+        logger_worker.error(f"Failed to init Storage Client: {e}", exc_info=True)
+        initialization_failed = True
+
+    try:
+        worker_bq_client = bigquery.Client(project=gcp_project_id)
+        logger_worker.info("BigQuery Client Initialized OK.")
+    except Exception as e:
+        logger_worker.error(f"Failed to init BigQuery Client: {e}", exc_info=True)
+        initialization_failed = True
+
+    try:
+        worker_subscriber = SubscriberClient() # SubscriberClient usually picks up ADC/ENV well
+        logger_worker.info("Pub/Sub Subscriber Client Initialized OK.")
+    except Exception as e:
+        logger_worker.error(f"Failed to init Pub/Sub Subscriber: {e}", exc_info=True)
+        initialization_failed = True
+
+    if initialization_failed:
+         logger_worker.critical("One or more worker clients failed initialization.")
+         raise RuntimeError("Worker client initialization failed.")
+    else:
+         logger_worker.info(f"Worker Clients initialized successfully using {auth_method}. Project: {WORKER_GCP_PROJECT}, Sub: {WORKER_PUBSUB_SUBSCRIPTION}")
+
+except Exception as e:
+    # Catch any unexpected errors during the entire setup process
+    logger_worker.critical(f"Worker setup failed during client initialization: {e}", exc_info=True)
+    worker_storage_client = None
+    worker_bq_client = None
+    worker_subscriber = None
+    raise # Re-raise to stop the worker
 # --- Worker Helper Functions (Keep existing: sanitize_bq_name, get_file_extension, map_pandas_dtype_to_bq) ---
 def sanitize_bq_name(name: str) -> str:
     """Sanitizes a string for use as a BigQuery table or column name."""
