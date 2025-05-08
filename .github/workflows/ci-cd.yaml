@@ -5,7 +5,7 @@ on:
     branches: [ develop ] # Trigger on push to ANY branch
   pull_request:
     branches: [ develop ] # Trigger on PRs to ANY branch
-
+    
 env:
   GCP_PROJECT_ID: crafty-tracker-457215-g6
   GAR_LOCATION: us-central1
