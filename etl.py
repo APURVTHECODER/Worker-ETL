@@ -23,7 +23,16 @@ import traceback
 # Import typing for better type hints
 from typing import Dict, Union, List, Optional, Any # Added Optional, Any, List
 # +++ MODIFICATION END +++
+# --- Multi-Table Detection Imports ---
+import numpy as np
+try:
+    import scipy.ndimage
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
+# For logging thread IDs
+import threading
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -59,6 +68,12 @@ WORKER_ROW_DENSITY_THRESHOLD = float(os.getenv("ROW_DENSITY_THRESHOLD", 0.3))
 WORKER_GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT_SECONDS", 90))
 WORKER_BQ_LOAD_TIMEOUT = int(os.getenv("BQ_LOAD_TIMEOUT_SECONDS", 300))
 
+# New Configurable Parameters for Multi-Table Detection (From Code A)
+WORKER_MIN_TABLE_ROWS = int(os.getenv("WORKER_MIN_TABLE_ROWS", 3)) # Min rows for a block to be considered a table (incl. header)
+WORKER_MIN_TABLE_COLS = int(os.getenv("WORKER_MIN_TABLE_COLS", 2)) # Min cols for a block
+WORKER_MIN_HEADER_CONFIDENCE = float(os.getenv("WORKER_MIN_HEADER_CONFIDENCE", 0.6)) # For scoring header likelihood (0-1)
+WORKER_BLOCK_DENSITY_THRESHOLD = float(os.getenv("WORKER_BLOCK_DENSITY_THRESHOLD", 0.25)) # Min overall density for a candidate block
+# WORKER_ROW_DENSITY_THRESHOLD from old code is likely still present but not used by the primary multi-table path.
 
 # --- Input Validation for Worker (Corrected) ---
 required_vars = {
@@ -221,31 +236,208 @@ def map_pandas_dtype_to_bq(dtype) -> str:
 
 # --- Worker Core Functions ---
 
-# +++ MODIFICATION START +++
+
+
+
 def _read_excel_sheets(io_source, pandas_opts) -> Dict[str, pd.DataFrame]:
-    """Internal helper to read all excel sheets."""
-    # Removed file_ext dependency as this is only called for excel
-    # Removed CSV fallback as it's incompatible with reading all sheets
     try:
         logger_worker.debug(f"Attempting pd.read_excel (all sheets) opts: {pandas_opts} source type: {type(io_source)}")
-        # Ensure stream is reset if possible
         if hasattr(io_source, 'seek') and callable(io_source.seek):
             try: io_source.seek(0); logger_worker.debug("Reset source stream position to 0 for multi-sheet read.")
             except io.UnsupportedOperation: logger_worker.debug("Source stream does not support seek for multi-sheet read.")
 
-        # Key change: sheet_name=None reads all sheets into a dictionary
         dfs_dict = pd.read_excel(io_source, engine=None, **pandas_opts, sheet_name=None)
         logger_worker.info(f"pd.read_excel read {len(dfs_dict)} sheets successfully.")
-        return dfs_dict # Success reading dictionary of sheets
+        
+        processed_dfs_dict = {}
+        for sheet_name, df_sheet in dfs_dict.items():
+            if df_sheet is not None:
+                df_sheet_processed = df_sheet.copy()
+                df_sheet_processed.reset_index(drop=True, inplace=True)
+                # Ensure columns are simple 0-based integers for consistent processing by _find_all_tables_in_sheet
+                df_sheet_processed.columns = range(df_sheet_processed.shape[1])
+                processed_dfs_dict[sheet_name] = df_sheet_processed
+            else:
+                # Handle case where a sheet might be read as None (e.g., completely empty sheet)
+                processed_dfs_dict[sheet_name] = pd.DataFrame() 
+        return processed_dfs_dict
     except ImportError as ie:
-         # Reraise import error to stop, indicating missing dependency
          if 'xlrd' in str(ie).lower(): logger_worker.critical("MISSING dependency: Reading .xls requires `xlrd`. `pip install xlrd`.")
          elif 'openpyxl' in str(ie).lower(): logger_worker.critical("MISSING dependency: Reading .xlsx requires `openpyxl`. `pip install openpyxl`.")
          else: logger_worker.error(f"ImportError reading Excel sheets: {ie}")
          raise
     except Exception as e:
         logger_worker.error(f"General pd.read_excel error reading all sheets: {e}", exc_info=True)
-        raise # Reraise other errors
+        raise
+
+
+
+
+
+
+
+def _score_table_candidate(
+    block_df: pd.DataFrame,
+    min_header_confidence: float = WORKER_MIN_HEADER_CONFIDENCE,
+    min_data_rows: int = 1
+) -> float:
+    if block_df.empty or block_df.shape[0] < 1 or block_df.shape[1] < 1:
+        return -1.0
+
+    block_df_for_density = block_df.replace(r'^\s*$', pd.NA, regex=True).replace(['None','none','null','NULL','NaN','NAN','<NA>','na','N/A','n/a'], pd.NA)
+    actual_data_points = block_df_for_density.notna().sum().sum()
+    total_cells = block_df.size
+    density = actual_data_points / total_cells if total_cells > 0 else 0
+
+    if density < (WORKER_BLOCK_DENSITY_THRESHOLD / 2): # Hard floor for density
+        logger_worker.debug(f"Candidate block rejected due to very low density: {density:.2f}")
+        return -1.0
+
+    header_score = 0.0
+    has_plausible_header = False
+    if block_df.shape[0] > 0: # Must have at least one row to be a header
+        first_row_series = block_df.iloc[0].astype(str) # Treat first row as potential header
+        first_row_non_null_count = first_row_series.replace(['None','none','null','NULL','NaN','NAN','<NA>','na','N/A','n/a',''], pd.NA).count()
+        first_row_distinct_count = first_row_series.nunique()
+
+        if first_row_non_null_count > 0 and \
+           (first_row_distinct_count / first_row_non_null_count) >= (min_header_confidence * 0.8) and \
+           first_row_distinct_count > 0: # At least one distinct value
+            numeric_header_values = pd.to_numeric(first_row_series, errors='coerce').notna().sum()
+            if (numeric_header_values / first_row_non_null_count) < 0.4: # Less than 40% numeric
+                header_score += 0.4
+                has_plausible_header = True
+            elif first_row_distinct_count == len(first_row_series): # All unique, strong sign
+                header_score += 0.3
+                has_plausible_header = True
+            else:
+                header_score += 0.1 # Some header indication
+
+    data_rows_count = block_df.shape[0] - 1 if has_plausible_header else block_df.shape[0]
+    if data_rows_count < min_data_rows:
+        logger_worker.debug(f"Candidate block rejected: only {data_rows_count} data rows (min {min_data_rows} required). Header plausible: {has_plausible_header}")
+        return -1.0
+
+    score = (density * 0.5) + (header_score * 0.3)
+    score += np.log1p(actual_data_points) * 0.01 
+    logger_worker.debug(f"Scored candidate (shape {block_df.shape}): Density={density:.2f}, HeaderScr={header_score:.2f}, DataPts={actual_data_points} -> FinalScr={score:.2f}")
+    return score
+
+
+
+
+def _find_all_tables_in_sheet(
+    original_sheet_df: pd.DataFrame,
+    min_rows: int = WORKER_MIN_TABLE_ROWS,
+    min_cols: int = WORKER_MIN_TABLE_COLS,
+    block_density_threshold: float = WORKER_BLOCK_DENSITY_THRESHOLD,
+    header_confidence: float = WORKER_MIN_HEADER_CONFIDENCE
+    # Consider passing object_name and sheet_name here for better logging if needed
+) -> List[Dict[str, Any]]:
+    # This log helps trace entry and SCIPY status for a given sheet processing
+    logger_worker.critical(f"LOCAL_FIND_ALL_TABLES_ENTRY_FOR_SHEET: Shape {original_sheet_df.shape} | SCIPY_AVAILABLE: {SCIPY_AVAILABLE} | Thread: {threading.get_ident()}")
+
+    if not SCIPY_AVAILABLE:
+        logger_worker.error("Scipy library not found. Multi-table detection per sheet is disabled. Install 'scipy'.")
+        if original_sheet_df.empty:
+            return []
+        
+        score = _score_table_candidate(original_sheet_df, header_confidence, max(1, min_rows -1))
+        if score > -0.5 and original_sheet_df.shape[0] >= min_rows and original_sheet_df.shape[1] >= min_cols:
+             logger_worker.warning("Scipy not available. Treating entire sheet as a single table candidate.")
+             df_copy = original_sheet_df.copy()
+             df_copy.reset_index(drop=True, inplace=True)
+             df_copy.columns = range(df_copy.shape[1])
+             return [{
+                 'df': df_copy,
+                 'id': 'table_1', 
+                 'coords_in_sheet': (0, 0, original_sheet_df.shape[0]-1, original_sheet_df.shape[1]-1),
+                 'score': score
+             }]
+        else:
+            logger_worker.warning("Scipy not available, and entire sheet does not qualify as a single table. No tables extracted.")
+            return []
+
+    if original_sheet_df.empty:
+        return []
+
+    logger_worker.debug(f"Starting multi-table search in sheet of shape: {original_sheet_df.shape}")
+    processed_df_for_mask = original_sheet_df.replace(r'^\s*$', pd.NA, regex=True).replace(['None','none','null','NULL','NaN','NAN','<NA>','na','N/A','n/a'], pd.NA)
+    content_mask = processed_df_for_mask.notna().to_numpy()
+    
+    # Using 8-connectivity by default. Consider structure=scipy.ndimage.generate_binary_structure(2, 1) for 4-connectivity
+    labeled_array, num_features = scipy.ndimage.label(content_mask, structure=np.ones((3,3)))
+    logger_worker.debug(f"Found {num_features} initial contiguous regions (features) in sheet.")
+    if num_features == 0: return []
+
+    object_slices = scipy.ndimage.find_objects(labeled_array)
+    candidate_tables = []
+    for i, slc_tuple in enumerate(object_slices):
+        if slc_tuple is None: continue
+        r_slice, c_slice = slc_tuple
+        r1, r2 = r_slice.start, r_slice.stop
+        c1, c2 = c_slice.start, c_slice.stop
+        num_block_rows = r2 - r1
+        num_block_cols = c2 - c1
+        if num_block_rows < min_rows or num_block_cols < min_cols:
+            logger_worker.debug(f"Region {i+1} too small ({num_block_rows}x{num_block_cols}). Min req: {min_rows}x{min_cols}. Skipping.")
+            continue
+        
+        candidate_df = original_sheet_df.iloc[r1:r2, c1:c2].copy()
+        candidate_df_for_density = candidate_df.replace(r'^\s*$', pd.NA, regex=True).replace(['None','none','null','NULL','NaN','NAN','<NA>','na','N/A','n/a'], pd.NA)
+        non_na_cells = candidate_df_for_density.notna().sum().sum()
+        total_cells = candidate_df.size
+        current_block_density = non_na_cells / total_cells if total_cells > 0 else 0
+
+        if current_block_density < block_density_threshold:
+            logger_worker.debug(f"Region {i+1} (shape {candidate_df.shape}) below density threshold ({current_block_density:.2f} < {block_density_threshold:.2f}). Skipping.")
+            continue
+        
+        logger_worker.debug(f"Region {i+1} (coords R{r1}-R{r2-1}, C{c1}-C{c2-1}, shape {candidate_df.shape}) passed size and density checks.")
+        candidate_tables.append({
+            'df_raw': candidate_df,
+            'coords_in_sheet': (r1, c1, r2 - 1, c2 - 1), # 0-indexed, inclusive
+            'score': 0.0 
+        })
+
+    if not candidate_tables:
+        logger_worker.info("No candidate regions met size/density criteria after connected components.")
+        return []
+
+    for candidate in candidate_tables:
+        min_data_rows_for_score = max(1, min_rows -1) if min_rows > 1 else 1
+        candidate['score'] = _score_table_candidate(candidate['df_raw'], header_confidence, min_data_rows_for_score)
+
+    valid_scored_candidates = [cand for cand in candidate_tables if cand['score'] > -0.5] # Use -0.5 to catch -1 precisely
+    valid_scored_candidates.sort(key=lambda x: x['score'], reverse=True)
+
+    final_tables_details = []
+    covered_mask_np = np.full(original_sheet_df.shape, False, dtype=bool)
+    table_counter = 0
+    for candidate in valid_scored_candidates:
+        r1, c1, r2_incl, c2_incl = candidate['coords_in_sheet']
+        if np.any(covered_mask_np[r1:r2_incl+1, c1:c2_incl+1]):
+            logger_worker.debug(f"Skipping candidate (score {candidate['score']:.2f}) at R{r1}-R{r2_incl}, C{c1}-C{c2_incl} due to overlap.")
+            continue
+
+        table_counter += 1
+        df_to_process = candidate['df_raw'].copy()
+        df_to_process.reset_index(drop=True, inplace=True)
+        df_to_process.columns = range(df_to_process.shape[1])
+
+        final_tables_details.append({
+            'df': df_to_process,
+            'id': f"table_{table_counter}",
+            'coords_in_sheet': (r1, c1, r2_incl, c2_incl),
+            'score': candidate['score']
+        })
+        covered_mask_np[r1:r2_incl+1, c1:c2_incl+1] = True
+        logger_worker.info(f"Selected table '{'table_'+str(table_counter)}' (score {candidate['score']:.2f}) at R{r1}-R{r2_incl}, C{c1}-C{c2_incl}. Shape {candidate['df_raw'].shape}")
+
+    logger_worker.info(f"Successfully extracted {len(final_tables_details)} non-overlapping tables from sheet.")
+    return final_tables_details
+
+
 
 def _isolate_data_block(df: pd.DataFrame) -> pd.DataFrame:
     """Isolates the main data block within a DataFrame, removing fully empty rows/cols."""
@@ -1042,134 +1234,186 @@ def load_to_bq(df: pd.DataFrame, table_id: str, schema_list: list, write_disposi
 
 # +++ MODIFICATION START +++
 # Modified process_object to handle multiple sheets from Excel
-def process_object(object_name: str, target_dataset_id: str): # Added target_dataset_id parameter
-    """Processes a GCS object: reads, cleans, determines schema, aligns, and loads to the target BigQuery dataset."""
-    logger_worker.info(f"--- Starting processing GCS object: {object_name} -> Target BQ Dataset: {target_dataset_id} ---")
-    all_sheets_successful = True
 
-    # Validate target_dataset_id format (basic example)
+def process_object(object_name: str, target_dataset_id: str):
+    logger_worker.critical(f"LOCAL_PROCESS_OBJECT_ENTRY_FOR: {object_name} | Thread: {threading.get_ident()}")
+    logger_worker.info(f"--- Starting processing GCS object: {object_name} -> Target BQ Dataset: {target_dataset_id} ---")
+    all_processing_successful = True
     if not re.match(r"^[a-zA-Z0-9_]+$", target_dataset_id):
-         logger_worker.error(f"Invalid target_dataset_id format received: '{target_dataset_id}'. Aborting processing.")
+         logger_worker.error(f"Invalid target_dataset_id format: '{target_dataset_id}'. Aborting.")
          raise ValueError(f"Invalid target dataset ID format: {target_dataset_id}")
 
     try:
-        # --- 1. Read Data ---
-        # Reads from the MANAGED bucket using the full object name provided
-        raw_data = read_data_from_gcs(WORKER_GCS_BUCKET, object_name)
-        if raw_data is None: raise ValueError(f"Failed to read data from GCS object: {object_name}")
+        logger_worker.critical(f"LOCAL_PROCESS_OBJECT_BEFORE_READ_FOR: {object_name} | Thread: {threading.get_ident()}")
+        # logger_worker.info(f"PROCESS_OBJECT_BEFORE_READ: Attempting to read GCS object: {object_name}") # Duplicate, covered by critical
+        raw_data_container = read_data_from_gcs(WORKER_GCS_BUCKET, object_name)
+        logger_worker.info(f"PROCESS_OBJECT_AFTER_READ: GCS object: {object_name}, raw_data_container type: {type(raw_data_container)}")
+        if raw_data_container is None: 
+            logger_worker.error(f"PROCESS_OBJECT_ERROR: Failed to read data for {object_name}, raw_data_container is None.")
+            raise ValueError(f"Failed to read data from GCS: {object_name}")
+        
+        sheets_to_process_map: Dict[str, pd.DataFrame] = {}
+        if isinstance(raw_data_container, pd.DataFrame):
+            sheets_to_process_map["_default_"] = raw_data_container
+            logger_worker.info("Read single DataFrame (CSV/Parquet or Excel fallback). Processing as default sheet.")
+        elif isinstance(raw_data_container, dict):
+            sheets_to_process_map = raw_data_container 
+            logger_worker.info(f"Read {len(raw_data_container)} sheets from Excel file.")
+        else:
+            raise TypeError(f"Unexpected data type from read_data_from_gcs: {type(raw_data_container)}")
 
-        # --- 2. Prepare Data Structure for Processing ---
-        sheets_to_process: Dict[str, pd.DataFrame] = {}
-        if isinstance(raw_data, pd.DataFrame): sheets_to_process["_default_"] = raw_data; logger_worker.info(f"Read single DataFrame (CSV/Parquet). Processing as default sheet.")
-        elif isinstance(raw_data, dict): sheets_to_process = raw_data; logger_worker.info(f"Read {len(raw_data)} sheets from Excel file.")
-        else: raise TypeError(f"Unexpected data type returned from read_data_from_gcs: {type(raw_data)}")
+        base_filename_sanitized = sanitize_bq_name(os.path.splitext(os.path.basename(object_name))[0])
+        overall_processed_table_count = 0
 
-        # --- 3. Process Each Sheet ---
-        # Extract base filename from the *last part* of the object_name
-        base_filename = sanitize_bq_name(os.path.splitext(os.path.basename(object_name))[0])
-        processed_sheet_count = 0
+        if not sheets_to_process_map: 
+            logger_worker.warning(f"No sheets/data found in {object_name}. Skipping."); 
+            return
 
-        if not sheets_to_process: logger_worker.warning(f"No sheets found or read from {object_name}. Skipping."); return
+        logger_worker.info(f"PROCESS_OBJECT_BEFORE_SHEET_LOOP: For {object_name}, sheets to process: {list(sheets_to_process_map.keys()) if sheets_to_process_map else 'None'}")
+        for sheet_name, original_raw_sheet_df in sheets_to_process_map.items():
+            logger_worker.info(f"PROCESS_OBJECT_SHEET_LOOP_ENTRY: For {object_name}, processing sheet: '{sheet_name}' (Shape: {original_raw_sheet_df.shape if original_raw_sheet_df is not None else 'None'})")
+            if original_raw_sheet_df is None or original_raw_sheet_df.empty:
+                logger_worker.warning(f"Sheet '{sheet_name}' is empty or None. Skipping sheet.")
+                continue
+            
+            identified_tables_in_sheet = _find_all_tables_in_sheet(
+                original_raw_sheet_df,
+                min_rows=WORKER_MIN_TABLE_ROWS, min_cols=WORKER_MIN_TABLE_COLS,
+                block_density_threshold=WORKER_BLOCK_DENSITY_THRESHOLD,
+                header_confidence=WORKER_MIN_HEADER_CONFIDENCE
+            )
 
-        for sheet_name, raw_sheet_df in sheets_to_process.items():
-            logger_worker.info(f"--- Processing sheet: '{sheet_name}' ---")
-            try:
-                if raw_sheet_df is None or raw_sheet_df.empty: logger_worker.warning(f"Sheet '{sheet_name}' is empty or None. Skipping."); continue
-                isolated_df = _isolate_data_block(raw_sheet_df)
-                if isolated_df.empty: logger_worker.warning(f"No data block found in sheet '{sheet_name}'. Skipping."); continue
-                cleaned_df = clean_dataframe(isolated_df)
-                if cleaned_df.empty: logger_worker.warning(f"Sheet '{sheet_name}' is empty after cleaning. Skipping."); continue
+            if not identified_tables_in_sheet:
+                logger_worker.info(f"No distinct tables found in sheet '{sheet_name}'.")
+                continue
+            logger_worker.info(f"Found {len(identified_tables_in_sheet)} distinct table candidate(s) in sheet '{sheet_name}'.")
 
-                # c. Determine target BigQuery table name (using base_filename and sheet_name)
-                sanitized_sheet_name = sanitize_bq_name(sheet_name)
-                target_table_name = base_filename if sheet_name == "_default_" else f"{base_filename}_{sanitized_sheet_name}"
-                # Ensure combined name doesn't exceed BQ limits (1024 chars)
-                target_table_name = target_table_name[:1024]
+            for table_data in identified_tables_in_sheet:
+                isolated_df_block = table_data['df'] 
+                table_suffix_id = table_data['id']
+                table_score = table_data['score']
+                logger_worker.info(f"--- Processing extracted table '{table_suffix_id}' from sheet '{sheet_name}' (Score: {table_score:.2f}, Shape: {isolated_df_block.shape}) ---")
 
-                # --- MODIFIED: Construct full table ID using the DYNAMIC dataset ID ---
-                table_id = f"{WORKER_GCP_PROJECT}.{target_dataset_id}.{target_table_name}"
-                logger_worker.info(f"Target BQ table for sheet '{sheet_name}': {table_id}")
+                cleaned_df = clean_dataframe(isolated_df_block) # Pass the already isolated block
+                if cleaned_df.empty:
+                    logger_worker.warning(f"Table '{table_suffix_id}' from sheet '{sheet_name}' is empty after cleaning. Skipping.")
+                    all_processing_successful = False; continue
 
-                # d. Determine schema for this sheet's data (using the full dynamic table_id)
-                schema = determine_schema(cleaned_df, table_id, WORKER_DEFAULT_SCHEMA_STRATEGY)
-                if schema is None: logger_worker.error(f"Schema determination failed for sheet '{sheet_name}' (table: {table_id}). Skipping sheet."); all_sheets_successful = False; continue
+                sanitized_sheet_name_for_bq = sanitize_bq_name(sheet_name)
+                final_bq_table_name_parts = [base_filename_sanitized]
+                
+                if sheet_name != "_default_" or len(sheets_to_process_map) > 1 or (len(identified_tables_in_sheet) > 1 and sheet_name == "_default_"):
+                    final_bq_table_name_parts.append(sanitized_sheet_name_for_bq)
+                
+                if len(identified_tables_in_sheet) > 1:
+                    final_bq_table_name_parts.append(sanitize_bq_name(table_suffix_id))
+                
+                final_bq_table_name = "_".join(part for part in final_bq_table_name_parts if part) 
+                final_bq_table_name = final_bq_table_name[:1024]
+                bq_table_id_full = f"{WORKER_GCP_PROJECT}.{target_dataset_id}.{final_bq_table_name}"
+                logger_worker.info(f"Target BQ table for '{table_suffix_id}' from sheet '{sheet_name}': {bq_table_id_full}")
 
-                # e. Align DataFrame to the determined schema
-                aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema)
-                if aligned_df.empty: logger_worker.warning(f"Aligned DataFrame for sheet '{sheet_name}' is empty (table: {table_id}). Skipping load."); continue # Skip if empty
+                try:
+                    schema = determine_schema(cleaned_df, bq_table_id_full, WORKER_DEFAULT_SCHEMA_STRATEGY)
+                    if schema is None: 
+                        logger_worker.error(f"Schema determination failed for {bq_table_id_full}. Skipping table.")
+                        all_processing_successful = False; continue
+                    
+                    aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema) # Pass copy
+                    if aligned_df.empty: 
+                        logger_worker.warning(f"DataFrame for {bq_table_id_full} empty after alignment. Skipping load.")
+                        continue
+                    
+                    load_to_bq(aligned_df, bq_table_id_full, schema, WORKER_DEFAULT_WRITE_DISPOSITION)
+                    overall_processed_table_count += 1
+                except Exception as per_table_error:
+                    logger_worker.error(f"--- Error processing table '{table_suffix_id}' ({bq_table_id_full}) from sheet '{sheet_name}': {per_table_error} ---", exc_info=True)
+                    all_processing_successful = False
 
-                # f. Load the aligned data to BigQuery (using the full dynamic table_id)
-                load_to_bq(aligned_df, table_id, schema, WORKER_DEFAULT_WRITE_DISPOSITION)
+        if overall_processed_table_count > 0 and all_processing_successful: 
+            logger_worker.info(f"--- Successfully processed all {overall_processed_table_count} table(s) from GCS: {object_name} -> {target_dataset_id} ---")
+        elif overall_processed_table_count > 0 and not all_processing_successful: 
+            logger_worker.warning(f"--- Partially processed GCS: {object_name} -> {target_dataset_id}. {overall_processed_table_count} table(s) loaded, errors on others. ---")
+        elif overall_processed_table_count == 0 and not sheets_to_process_map: 
+            logger_worker.info(f"--- Finished {object_name}: No data/sheets found. ---")
+        elif overall_processed_table_count == 0 and all_processing_successful: 
+            logger_worker.warning(f"--- Finished {object_name}: No valid tables found/loaded to {target_dataset_id}. ---")
+        else: # overall_processed_table_count == 0 and not all_processing_successful
+             logger_worker.error(f"--- Failed to process any tables successfully for GCS: {object_name} -> {target_dataset_id}. ---")
+             if sheets_to_process_map: # If sheets existed but yielded no tables due to errors
+                  raise Exception(f"Failed to process any table successfully for {object_name} despite data being present.")
 
-                logger_worker.info(f"--- Successfully processed sheet: '{sheet_name}' -> {table_id} ---")
-                processed_sheet_count += 1
-
-            except Exception as sheet_error:
-                logger_worker.error(f"--- Error processing sheet: '{sheet_name}' for object {object_name} -> {target_dataset_id}: {sheet_error} ---", exc_info=True)
-                all_sheets_successful = False # Mark overall process as partially failed
-
-        # --- 4. Final Logging for the Object ---
-        if processed_sheet_count > 0 and all_sheets_successful: logger_worker.info(f"--- Successfully processed all {processed_sheet_count} sheet(s) for GCS object: {object_name} -> {target_dataset_id} ---")
-        elif processed_sheet_count > 0 and not all_sheets_successful: logger_worker.warning(f"--- Partially processed GCS object: {object_name} -> {target_dataset_id}. {processed_sheet_count} sheet(s) loaded, errors on others. See logs. ---")
-        elif processed_sheet_count == 0 and not sheets_to_process: logger_worker.info(f"--- Finished object {object_name}: No sheets found. ---")
-        elif processed_sheet_count == 0 and all_sheets_successful: logger_worker.warning(f"--- Finished object {object_name}: All sheets skipped (e.g., empty). No data loaded to {target_dataset_id}. ---")
-        else: # processed_sheet_count == 0 and not all_sheets_successful
-             logger_worker.error(f"--- Failed to process any sheets successfully for GCS object: {object_name} -> {target_dataset_id}. See errors. ---")
-             if sheets_to_process and processed_sheet_count == 0: raise Exception(f"Failed to process any sheet successfully for {object_name}")
-
-    except FileNotFoundError:
-        logger_worker.warning(f"GCS object not found: '{object_name}'. Cannot process. Allowing ACK.")
-        return # Do not re-raise, allow callback to ACK
+    except FileNotFoundError: 
+        logger_worker.warning(f"GCS object not found: '{object_name}'. Allowing ACK.")
+        return
+    except ImportError as imp_err: 
+        logger_worker.critical(f"PROCESS_OBJECT_IMPORT_ERROR: For {object_name}: {imp_err}. If 'scipy', multi-table detection failed.", exc_info=True)
+        raise 
     except Exception as e:
-        logger_worker.error(f"--- Critical error during processing of GCS object {object_name} for dataset {target_dataset_id}: {type(e).__name__} - {e} ---", exc_info=True)
-        raise # Re-raise exception for NACKing
+        logger_worker.error(f"PROCESS_OBJECT_CRITICAL_ERROR: For GCS object {object_name}, dataset {target_dataset_id}: {type(e).__name__} - {e}", exc_info=True)
+        raise
+
+
+
+
+
+
 
 # +++ MODIFICATION END +++
 
 # callback function remains UNCHANGED
 def callback(message):
-    """Callback function for Pub/Sub message processing. Expects JSON payload."""
     object_name = None
     target_dataset_id = None
     raw_message_data = message.data
+    
+    # Initialize for logging, in case of early decode failure
+    object_name_for_log = "PRE_DECODE_UNKNOWN"
+    temp_object_name_for_log = "UNKNOWN_OBJECT_IN_CALLBACK" 
 
     try:
-        # 1. Decode and Parse JSON message data
         message_str = raw_message_data.decode("utf-8")
-        logger_worker.debug(f"Received raw Pub/Sub message data: {message_str}")
         message_data = json.loads(message_str)
-
-        # Extract required fields
         object_name = message_data.get("object_name")
+        
+        # Update for logging after successful decode
+        object_name_for_log = object_name or "OBJECT_NAME_MISSING_IN_JSON"
+        temp_object_name_for_log = object_name_for_log
+
         target_dataset_id = message_data.get("target_dataset_id")
 
+        # This critical log is now placed *after* attempting to decode object_name
+        logger_worker.critical(f"LOCAL_CALLBACK_RECEIVED_MESSAGE_FOR: {object_name_for_log} | Thread: {threading.get_ident()}")
+        logger_worker.info(f"CALLBACK_ENTRY: Processing Pub/Sub message for object: {temp_object_name_for_log}, Target Dataset: {target_dataset_id}")
+
+
         if not object_name or not target_dataset_id:
-            logger_worker.error(f"Invalid Pub/Sub message format: Missing 'object_name' or 'target_dataset_id'. Data: {message_str}")
-            message.nack() # NACK invalid format messages
+            logger_worker.error(f"CALLBACK_ERROR: Invalid Pub/Sub message format for {temp_object_name_for_log}: Missing 'object_name' or 'target_dataset_id'. Data: {message_str}")
+            message.nack()
             return
 
-        logger_worker.info(f"Received Pub/Sub message, processing GCS object: {object_name} for BQ Dataset: {target_dataset_id}")
-
-        # 2. Process the object using extracted info
-        process_object(object_name, target_dataset_id)
-
-        # 3. Acknowledge the message if process_object completes successfully
-        #    (FileNotFound is handled inside process_object and doesn't raise here)
+        process_object(object_name, target_dataset_id) # This is where the main work happens
+        
         message.ack()
-        logger_worker.info(f"Successfully processed and ACKed message for: {object_name} -> {target_dataset_id}")
+        logger_worker.info(f"CALLBACK_SUCCESS: ACKed message for: {object_name}")
 
     except json.JSONDecodeError as json_err:
-        logger_worker.error(f"Failed to parse Pub/Sub message JSON: {json_err}. Raw Data: '{raw_message_data.decode('utf-8', errors='replace')}'")
-        message.nack() # NACK messages that are not valid JSON
-    except FileNotFoundError as fnf_err:
-         # Should be handled by process_object, but double-check
-         logger_worker.warning(f"File not found during processing: {fnf_err}. Acknowledging message.")
-         message.ack() # ACK if file not found
+        # object_name_for_log would still be "PRE_DECODE_UNKNOWN" or its initial value if json.loads fails
+        logger_worker.error(f"CALLBACK_JSON_ERROR: For initial log name '{object_name_for_log}'. Failed to parse Pub/Sub message JSON: {json_err}. Raw Data: '{raw_message_data.decode('utf-8', errors='replace')}'")
+        message.nack()
     except Exception as e:
-        # Catch all other exceptions raised from process_object or JSON parsing/validation
-        logger_worker.exception(f"CRITICAL error processing message for GCS object '{object_name or 'UNKNOWN'}' -> Dataset '{target_dataset_id or 'UNKNOWN'}': {e}")
-        message.nack() # NACK on processing errors
-        logger_worker.info(f"NACKed message for: {object_name or 'UNKNOWN'}")
+        # temp_object_name_for_log will hold the best guess for object_name
+        logger_worker.exception(f"CALLBACK_CRITICAL_ERROR: For {temp_object_name_for_log}. Error: {e}")
+        message.nack()
+        logger_worker.info(f"CALLBACK_NACK: NACKed message for: {temp_object_name_for_log} due to critical error.")
+    # Note: The critical log "LOCAL_CALLBACK_RECEIVED_MESSAGE_FOR" is now inside the try block,
+    # so if json.loads fails, it won't print the decoded object_name. This is acceptable.
+    # If you need it outside, you'd have to handle the decode failure before it.
+
+
+
+
+
 
 # Main execution block remains UNCHANGED
 if __name__ == "__main__":
