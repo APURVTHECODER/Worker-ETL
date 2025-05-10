@@ -2,10 +2,10 @@ name: Worker CI/CD
 
 on:
   push:
-    branches: [ main ] # Trigger on push to ANY branch
+    branches: [ develop ] # Trigger on push to ANY branch
   pull_request:
-    branches: [ main ] # Trigger on PRs to ANY branch
-
+    branches: [ develop ] # Trigger on PRs to ANY branch
+    
 env:
   GCP_PROJECT_ID: crafty-tracker-457215-g6
   GAR_LOCATION: us-central1
