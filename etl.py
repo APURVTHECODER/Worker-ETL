@@ -74,7 +74,19 @@ WORKER_MIN_TABLE_COLS = int(os.getenv("WORKER_MIN_TABLE_COLS", 2)) # Min cols fo
 WORKER_MIN_HEADER_CONFIDENCE = float(os.getenv("WORKER_MIN_HEADER_CONFIDENCE", 0.6)) # For scoring header likelihood (0-1)
 WORKER_BLOCK_DENSITY_THRESHOLD = float(os.getenv("WORKER_BLOCK_DENSITY_THRESHOLD", 0.25)) # Min overall density for a candidate block
 # WORKER_ROW_DENSITY_THRESHOLD from old code is likely still present but not used by the primary multi-table path.
-
+# At the top of your etl.py, with other imports
+try:
+    import google.generativeai as genai
+    # Configure the API key (do this once, perhaps in your main worker setup near client init)
+    if WORKER_GEMINI_API_KEY:
+        genai.configure(api_key=WORKER_GEMINI_API_KEY)
+        logger_worker.info("Gemini API Key configured for Google AI SDK.")
+    else:
+        logger_worker.warning("Gemini API Key not found, AI features requiring it will be disabled.")
+    GEMINI_SDK_AVAILABLE = True
+except ImportError:
+    logger_worker.warning("Google Generative AI SDK not installed (pip install google-generativeai). AI header processing will be disabled.")
+    GEMINI_SDK_AVAILABLE = False
 # --- Input Validation for Worker (Corrected) ---
 required_vars = {
     "GCP_PROJECT": WORKER_GCP_PROJECT, "GCS_BUCKET": WORKER_GCS_BUCKET,
@@ -207,18 +219,16 @@ def sanitize_bq_name(name: str) -> str:
     """Sanitizes a string for use as a BigQuery table or column name."""
     if not isinstance(name, str):
         name = str(name)
-    # Remove leading/trailing whitespace
     name = name.strip()
     # Replace invalid characters (anything not a letter, number, or underscore) with underscore
-    name = re.sub(r'[^\w]', '_', name)
+    name = re.sub(r'[^\w]', '_', name) # Keep underscores
     # Ensure name starts with a letter or underscore
-    if name and not re.match(r'^[a-zA-Z_]', name):
+    if name and not re.match(r'^[a-zA-Z_]', name): # Allow leading underscore
         name = '_' + name
-    # Handle empty names after sanitization
+    # Remove consecutive underscores that might result from multiple replacements
+    name = re.sub(r'_+', '_', name)
     if not name:
         name = '_unnamed'
-    # Truncate to BigQuery's maximum length for table/column names (1024, but often limited further in practice, e.g., 300 is safer for combined names)
-    # Let's use 300 for safety in combined names. BQ max is 1024.
     return name[:300]
 
 def get_file_extension(object_name: str) -> str: return os.path.splitext(object_name)[1].lower()
@@ -619,7 +629,67 @@ def read_data_from_gcs(bucket_name: str, object_name: str) -> Union[pd.DataFrame
 
 
 # ============================ Start of pasted remaining functions ============================
+# etl.py
+# Place this near the original clean_dataframe
 
+# +++ NEW FUNCTION (Variation of clean_dataframe) +++
+def _clean_dataframe_pre_headered(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cleans a DataFrame that is assumed to already have its headers correctly set.
+    Focuses on sanitizing column names, NA handling, and type preparation.
+    Does NOT attempt header promotion.
+    """
+    if df.empty:
+        logger_worker.warning("Input DF to _clean_dataframe_pre_headered is empty.")
+        return df
+
+    logger_worker.info(f"Cleaning pre-headered data block (Shape: {df.shape}). Columns: {list(df.columns)[:5]}...")
+
+    # --- Sanitize existing column names ---
+    original_columns = list(df.columns) # Keep for logging
+    # Ensure all column names are strings before sanitizing
+    sanitized_columns = [sanitize_bq_name(str(col)) for col in original_columns]
+
+    # Handle duplicate column names after sanitization
+    final_columns = []
+    counts: Dict[str, int] = {}
+    for col_name_candidate in sanitized_columns:
+        current_count = counts.get(col_name_candidate, 0)
+        new_col_name = f"{col_name_candidate}_{current_count}" if current_count > 0 else col_name_candidate
+        final_columns.append(new_col_name[:300]) # Ensure length constraint from sanitize_bq_name
+        counts[col_name_candidate] = current_count + 1
+    
+    if original_columns != final_columns:
+        logger_worker.debug(f"Sanitized pre-set column names. Original: {original_columns[:5]}..., Final: {final_columns[:5]}...")
+
+    df.columns = final_columns
+
+    # --- Final NA handling and cleanup ---
+    # Drop fully empty columns/rows (can occur if original data was very sparse)
+    df.dropna(axis=1, how='all', inplace=True)
+    df.dropna(axis=0, how='all', inplace=True)
+
+    if df.empty:
+        logger_worker.warning("DataFrame became empty after NA drops in _clean_dataframe_pre_headered.")
+        return df.reset_index(drop=True)
+
+    # Strip whitespace from object/string columns
+    df_cleaned = df.copy() # Work on a copy
+    for col in df_cleaned.select_dtypes(include=['object', 'string']).columns:
+        if col in df_cleaned.columns: # Check if column still exists
+            try:
+                df_cleaned[col] = df_cleaned[col].astype(str).str.strip()
+            except Exception as strip_err:
+                logger_worker.warning(f"Failed to strip whitespace from column '{col}' in pre-headered clean: {strip_err}")
+
+    # Replace common null-like strings with actual NA/None
+    common_nulls = ['', 'none', 'null', 'nan', '<na>', 'nat'] 
+    for null_val in common_nulls:
+        df_cleaned.replace(f'(?i)^{re.escape(null_val)}$', pd.NA, regex=True, inplace=True)
+
+    logger_worker.info(f"Pre-headered cleaning complete. Final shape: {df_cleaned.shape}")
+    return df_cleaned.reset_index(drop=True)
+# +++ END NEW FUNCTION +++
 # clean_dataframe function remains UNCHANGED
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty: logger_worker.warning("Input DF to clean_dataframe empty."); return df
@@ -1232,12 +1302,337 @@ def load_to_bq(df: pd.DataFrame, table_id: str, schema_list: list, write_disposi
         raise # Re-raise the exception
 
 
+# etl.py
+# Place this near other helper functions like sanitize_bq_name
+
+# +++ NEW FUNCTION +++
+def _clean_header_cell_text(cell_value: Any) -> str:
+    """Cleans and standardizes text from a header cell."""
+    if pd.isna(cell_value):
+        return ""
+    
+    text = str(cell_value).strip()
+    # Replace multiple spaces/newlines with a single space, then replace space with underscore
+    text = re.sub(r'\s+', ' ', text) 
+    text = text.replace(' ', '_')
+    # Remove characters not suitable for BQ names (alphanumeric and underscore)
+    # This is a bit more aggressive than sanitize_bq_name for intermediate parts.
+    text = re.sub(r'[^\w_]', '', text) 
+    return text.lower()
+# +++ END NEW FUNCTION +++
+
+# etl.py
+
+# ... (after _clean_header_cell_text, before process_object) ...
+
+# +++ NEW FUNCTION +++
+
+
+def _header_df_to_csv_string(df: pd.DataFrame) -> str:
+    """Converts a header DataFrame to a simple CSV string for the AI prompt."""
+    # Fill NaNs with empty string for CSV representation
+    return df.fillna('').to_csv(header=False, index=False)
+
+
+
+
+
+
+
+# etl.py
+# ... (other imports) ...
+# try:
+# import google.generativeai as genai # This should already be at the top of your file
+# ... (Gemini SDK initialization and GEMINI_SDK_AVAILABLE flag) ...
+# except ImportError:
+# ...
+
+# ... (_clean_header_cell_text and _header_df_to_csv_string functions) ...
+
+# +++ AI-POWERED HEADER FLATTENING FUNCTION - WITH ACTUAL GEMINI CALL +++
+def _get_flattened_headers_via_ai(
+    header_material_df: pd.DataFrame,
+    header_depth: int, # User specified depth
+    num_expected_cols: int,
+    file_context_for_log: str
+) -> Optional[List[str]]:
+    log_prefix = f"AIHeaderFlatten ({file_context_for_log}, Depth: {header_depth})"
+    logger_worker.info(f"{log_prefix}: Attempting to get flattened headers via AI.")
+
+    # Check for SDK and API Key should already be done by `attempt_ai_processing`
+    # but an extra guard here is fine.
+    if not GEMINI_SDK_AVAILABLE or not WORKER_GEMINI_API_KEY:
+        logger_worker.error(f"{log_prefix}: Gemini SDK or API key not available. Cannot use AI for headers.")
+        return None
+
+    try:
+        header_csv_string = _header_df_to_csv_string(header_material_df)
+        
+        # Few-shot examples should be part of the prompt string itself
+        # Ensure examples cover your 2-level and 3-level cases accurately
+        prompt = f"""You are an expert Excel header interpreter.
+Given the following header rows (provided as CSV string, {header_depth} rows deep) and the number of original columns ({num_expected_cols}):
+<header_csv_start>
+{header_csv_string}</header_csv_end>
+
+Your task is to generate a flattened, single-string column name for each of the {num_expected_cols} original columns.
+1. Identify logical groupings and hierarchies.
+2. Propagate headers horizontally for merged cells (e.g., if 'OVERALL' in Row 1 applies to multiple columns, its text should be part of names for columns under that span).
+3. Propagate headers vertically for merged cells (e.g., if 'Name' in Row 2 applies to a blank cell in Row 3 for that column, 'Name' should be used for that path).
+4. Combine hierarchical parts using an underscore (_). Example: MASTER_SUB_SUBSUB.
+5. Clean each part: lowercase, replace spaces with underscores, remove non-alphanumeric characters (except underscore).
+6. If a column has no meaningful header text across all its header rows after considering merges, name it `_unnamed_col_X` (0-indexed X).
+7. IMPORTANT: Output ONLY a valid JSON list of strings, with exactly {num_expected_cols} strings. Do not include any other explanatory text or markdown backticks around the JSON.
+
+Example 1 (Input header_depth=2, num_columns=6):
+Input CSV:
+"Payment Mode",,"Name","Dept Code",,"Total Sales"
+"Online","Offline",,"OLD","NEW",
+Output JSON:
+["payment_mode_online", "payment_mode_offline", "name", "dept_code_old", "dept_code_new", "total_sales"]
+
+Example 2 (Input header_depth=3, num_columns=6):
+Input CSV:
+"OVERALL",,,,,
+"Payment Mode",,"Name","Dept Code",,"Total Sales"
+"Online","Offline",,"OLD","NEW",
+Output JSON:
+["overall_payment_mode_online", "overall_payment_mode_offline", "overall_name", "overall_dept_code_old", "overall_dept_code_new", "overall_total_sales"]
+
+Example 3 (Input header_depth=1, num_columns=3):
+Input CSV:
+"Column A","Column B","Column C"
+Output JSON:
+["column_a", "column_b", "column_c"]
+
+Now, process the provided header_csv_start/end block for {num_expected_cols} columns and provide the output JSON list:
+"""
+        logger_worker.debug(f"{log_prefix}: AI Prompt (first 500 chars):\n{prompt[:500]}")
+        logger_worker.debug(f"{log_prefix}: Full Header CSV for AI:\n{header_csv_string}")
+
+
+        # --- ACTUAL GEMINI API CALL ---
+        model = genai.GenerativeModel('gemini-1.5-flash-latest') # Or 'gemini-1.0-pro' if flash struggles
+        
+        # Safety settings can be useful to prevent harmful or off-topic responses,
+        # though less critical for this structured task.
+        # safety_settings = [
+        #     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        #     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        #     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        #     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        # ]
+
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.1, # Low temperature for more deterministic/structured output
+                response_mime_type="application/json" # Request JSON directly
+            ),
+            # safety_settings=safety_settings, # Optional
+            request_options={'timeout': WORKER_GEMINI_TIMEOUT // 2} # Use a shorter timeout than for schema inference
+        )
+        # --- END ACTUAL GEMINI API CALL ---
+        logger_worker.debug(f"{log_prefix}: AI Raw Response Text (from response.text): {response.text if hasattr(response, 'text') else 'No text attribute'}")
+        logger_worker.debug(f"{log_prefix}: AI Raw Response Text: {response.text}")
+        
+        # It's good practice to check if response.parts exists and is not empty
+        if not response.parts: # Check if the response even has parts
+            logger_worker.warning(f"{log_prefix}: AI response has no parts. Full response object: {response}")
+            # Check for blocking reasons if prompt_feedback is available
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
+                block_reason_msg = getattr(response.prompt_feedback, 'block_reason_message', str(response.prompt_feedback.block_reason))
+                logger_worker.error(f"{log_prefix}: AI request was blocked. Reason: {block_reason_msg}")
+            # Consider logging other parts of `response.prompt_feedback` or safety_ratings if available
+            # e.g., logger_worker.debug(f"{log_prefix}: Safety Ratings: {response.prompt_feedback.safety_ratings if hasattr(response.prompt_feedback, 'safety_ratings') else 'N/A'}")
+            return None
+
+        generated_json_text = response.text.strip() # response.text should directly give the JSON string if response_mime_type="application/json" worked
+
+        # Clean potential markdown backticks if the model still adds them
+        if generated_json_text.startswith("```json"):
+           generated_json_text = generated_json_text[len("```json"):].strip()
+        if generated_json_text.endswith("```"):
+           generated_json_text = generated_json_text[:-len("```")].strip()
+
+        if not generated_json_text:
+            logger_worker.warning(f"{log_prefix}: AI returned empty content after stripping potential markdown.")
+            return None
+
+        try:
+            flattened_names = json.loads(generated_json_text)
+            if not isinstance(flattened_names, list):
+                logger_worker.error(f"{log_prefix}: AI output was not a JSON list. Got: {type(flattened_names)}")
+                return None
+            if len(flattened_names) != num_expected_cols:
+                logger_worker.error(f"{log_prefix}: AI returned {len(flattened_names)} names, expected {num_expected_cols}. Output: {flattened_names}")
+                return None
+            if not all(isinstance(name, str) for name in flattened_names):
+                logger_worker.error(f"{log_prefix}: AI output list does not contain all strings. Output: {flattened_names}")
+                return None
+            
+            logger_worker.info(f"{log_prefix}: Successfully parsed flattened headers from AI.")
+            logger_worker.debug(f"{log_prefix}: AI Flattened Names: {flattened_names}")
+            return flattened_names
+        except json.JSONDecodeError as e:
+            logger_worker.error(f"{log_prefix}: Failed to parse JSON from AI: {e}. Raw Response Text: {generated_json_text}")
+            return None
+        except Exception as e_val: # Catch other validation errors
+            logger_worker.error(f"{log_prefix}: Error validating AI output structure: {e_val}. Output: {generated_json_text}", exc_info=True)
+            return None
+
+    except Exception as e: # Catch errors from AI call itself (e.g., API errors, timeouts)
+        logger_worker.error(f"{log_prefix}: Error during AI header processing call: {e}", exc_info=True)
+        return None
+# +++ END NEW AI FUNCTION +++
+
+
+
+
+
+
+# +++ REVISED _process_multi_header_block (Version 7) +++
+def _process_multi_header_block(
+    raw_block_df: pd.DataFrame,
+    header_depth: int,
+    object_name_for_log: str = "UnknownObject",
+    sheet_name_for_log: str = "UnknownSheet",
+    table_id_for_log: str = "UnknownTableInSheet"
+) -> Optional[pd.DataFrame]:
+    log_prefix = f"MultiHeaderProc V7 (Obj: {object_name_for_log}, Sheet: {sheet_name_for_log}, Table: {table_id_for_log}, Depth: {header_depth})"
+    logger_worker.info(f"{log_prefix}: Starting processing for block of shape {raw_block_df.shape}.")
+
+    if raw_block_df.empty or header_depth <= 0: # ... (same)
+        logger_worker.warning(f"{log_prefix}: Input block empty or invalid header_depth.")
+        return None
+    current_header_depth = min(header_depth, raw_block_df.shape[0]) # ... (same)
+    if current_header_depth != header_depth: # ... (same)
+        logger_worker.warning(f"{log_prefix}: Original header_depth ({header_depth}) adjusted to ({current_header_depth}).")
+    header_depth = current_header_depth
+
+    header_material_df = raw_block_df.iloc[:header_depth, :].copy()
+    data_df = raw_block_df.iloc[header_depth:, :].copy().reset_index(drop=True)
+    
+    logger_worker.debug(f"{log_prefix}: Initial header_material_df:\n{header_material_df.to_string()}")
+
+    if header_material_df.empty: # ... (same)
+        logger_worker.warning(f"{log_prefix}: Header material is empty.")
+        if data_df.empty: return None
+        logger_worker.info(f"{log_prefix}: Header material empty but data exists. Returning None for fallback.")
+        return None
+
+    processed_header_df = header_material_df.copy()
+
+    # Step 1: Horizontal fill ONLY on the VERY FIRST header row (if header_depth > 0)
+    # This is to catch master headers like "Payment Mode" that span horizontally.
+    if header_depth > 0:
+        logger_worker.debug(f"{log_prefix}: Applying horizontal ffill to FIRST header row only.")
+        processed_header_df.iloc[0, :] = processed_header_df.iloc[0, :].ffill()
+    logger_worker.debug(f"{log_prefix}: Headers after H-ffill on FIRST row:\n{processed_header_df.to_string()}")
+
+    # Step 2: Vertical fill on ALL columns.
+    # This should propagate "Name" from row 0 to row 1 in the "Name" column.
+    # And "Payment Mode" from row 0 to row 1 in the "Payment Mode" columns (if it was NaN there).
+    logger_worker.debug(f"{log_prefix}: Applying vertical ffill to ALL columns.")
+    processed_header_df.ffill(axis=0, inplace=True)
+    logger_worker.debug(f"{log_prefix}: Headers after V-ffill on ALL columns:\n{processed_header_df.to_string()}")
+    
+    # Step 3: Clean all cell text.
+    logger_worker.debug(f"{log_prefix}: Cleaning header cell text.")
+    for r_idx in range(processed_header_df.shape[0]):
+        for c_idx in range(processed_header_df.shape[1]):
+            processed_header_df.iloc[r_idx, c_idx] = _clean_header_cell_text(processed_header_df.iloc[r_idx, c_idx])
+    logger_worker.debug(f"{log_prefix}: Headers after CLEANING:\n{processed_header_df.to_string()}")
+
+    # Step 4: Flatten Headers (same logic as before)
+    # ... (The flattening loop from Version 6 / V4-DEBUG) ...
+    flattened_column_names: List[str] = []
+    num_original_cols = processed_header_df.shape[1]
+    for c_idx in range(num_original_cols):
+        name_parts: List[str] = []
+        column_header_stack = processed_header_df.iloc[:, c_idx].tolist()
+        last_added_part = None
+        for r_idx in range(header_depth):
+            cell_text = str(column_header_stack[r_idx])
+            if cell_text: 
+                if not name_parts or name_parts[-1] != cell_text:
+                    name_parts.append(cell_text)
+        if name_parts:
+            final_name = "_".join(name_parts)
+            flattened_column_names.append(final_name)
+        else:
+            fallback_name = f"_unnamed_col_{c_idx}"
+            flattened_column_names.append(fallback_name)
+    logger_worker.debug(f"{log_prefix}: Generated flattened names: {flattened_column_names}")
+
+    # Step 5: Assign to data_df and Validate (same)
+    # ... (validation and assignment) ...
+    if len(flattened_column_names) != data_df.shape[1] and not data_df.empty:
+        logger_worker.error(f"{log_prefix}: Mismatch: {len(flattened_column_names)} names vs {data_df.shape[1]} data cols.")
+        if data_df.shape[1] == 0 and len(flattened_column_names) > 0:
+             logger_worker.warning(f"{log_prefix}: Data part has 0 columns. Creating empty DF with headers.")
+             return pd.DataFrame(columns=flattened_column_names)
+        return None
+
+    if data_df.empty:
+        logger_worker.info(f"{log_prefix}: Data part empty. Returning empty DF with headers: {flattened_column_names}")
+        return pd.DataFrame(columns=flattened_column_names)
+        
+    data_df.columns = flattened_column_names
+    logger_worker.info(f"{log_prefix}: Successfully processed. Final data shape: {data_df.shape}. Cols: {list(data_df.columns)}")
+    
+    return data_df
+# +++ END REVISED FUNCTION +++
+
+
+
+
+
+
+
+
+
+
+# +++ END NEW FUNCTION +++
 # +++ MODIFICATION START +++
 # Modified process_object to handle multiple sheets from Excel
+# etl.py
 
-def process_object(object_name: str, target_dataset_id: str):
+# ... (all your existing imports and other functions like sanitize_bq_name, 
+#      _read_excel_sheets, _find_all_tables_in_sheet, clean_dataframe, 
+#      _clean_header_cell_text, _process_multi_header_block, _clean_dataframe_pre_headered,
+#      determine_schema, align_dataframe_to_schema, load_to_bq etc. should be above this) ...
+
+# +++ MODIFIED FUNCTION +++
+# etl.py
+
+# ... (all your existing imports: os, io, json, re, logging, pd, etc.)
+# ... (Gemini import and configuration as shown above)
+# ... (Worker Configurations, Client Initializations)
+# ... (Helper functions: sanitize_bq_name, get_file_extension, map_pandas_dtype_to_bq)
+# ... (_read_excel_sheets, _score_table_candidate, _find_all_tables_in_sheet)
+# ... (_isolate_data_block - though this might be less used if AI/multi-header handles block start)
+# ... (read_data_from_gcs)
+# ... (_clean_header_cell_text) <--- Ensure this is defined
+# ... (_get_flattened_headers_via_ai) <--- Ensure this is defined
+# ... (_clean_dataframe_pre_headered) <--- Ensure this is defined
+# ... (clean_dataframe - your original one) <--- Ensure this is defined
+# ... (infer_schema_gemini, infer_schema_pandas, get_existing_schema, determine_schema)
+# ... (align_dataframe_to_schema, load_to_bq)
+
+
+# +++ FULLY MODIFIED process_object FUNCTION FOR HYBRID AI APPROACH +++
+def process_object(
+    object_name: str,
+    target_dataset_id: str,
+    is_multi_header_file: bool = False,
+    header_depth_from_user: Optional[int] = None
+):
     logger_worker.critical(f"LOCAL_PROCESS_OBJECT_ENTRY_FOR: {object_name} | Thread: {threading.get_ident()}")
-    logger_worker.info(f"--- Starting processing GCS object: {object_name} -> Target BQ Dataset: {target_dataset_id} ---")
+    logger_worker.info(
+        f"--- Starting processing GCS object: {object_name} -> Target BQ Dataset: {target_dataset_id} "
+        f"(Multi-Header Mode: {is_multi_header_file}, User Depth: {header_depth_from_user}, AI SDK: {GEMINI_SDK_AVAILABLE}) ---"
+    )
     all_processing_successful = True
     if not re.match(r"^[a-zA-Z0-9_]+$", target_dataset_id):
          logger_worker.error(f"Invalid target_dataset_id format: '{target_dataset_id}'. Aborting.")
@@ -1245,19 +1640,18 @@ def process_object(object_name: str, target_dataset_id: str):
 
     try:
         logger_worker.critical(f"LOCAL_PROCESS_OBJECT_BEFORE_READ_FOR: {object_name} | Thread: {threading.get_ident()}")
-        # logger_worker.info(f"PROCESS_OBJECT_BEFORE_READ: Attempting to read GCS object: {object_name}") # Duplicate, covered by critical
         raw_data_container = read_data_from_gcs(WORKER_GCS_BUCKET, object_name)
         logger_worker.info(f"PROCESS_OBJECT_AFTER_READ: GCS object: {object_name}, raw_data_container type: {type(raw_data_container)}")
-        if raw_data_container is None: 
+        if raw_data_container is None:
             logger_worker.error(f"PROCESS_OBJECT_ERROR: Failed to read data for {object_name}, raw_data_container is None.")
             raise ValueError(f"Failed to read data from GCS: {object_name}")
-        
+
         sheets_to_process_map: Dict[str, pd.DataFrame] = {}
         if isinstance(raw_data_container, pd.DataFrame):
             sheets_to_process_map["_default_"] = raw_data_container
-            logger_worker.info("Read single DataFrame (CSV/Parquet or Excel fallback). Processing as default sheet.")
+            logger_worker.info("Read single DataFrame (CSV/Parquet). Processing as default sheet.")
         elif isinstance(raw_data_container, dict):
-            sheets_to_process_map = raw_data_container 
+            sheets_to_process_map = raw_data_container
             logger_worker.info(f"Read {len(raw_data_container)} sheets from Excel file.")
         else:
             raise TypeError(f"Unexpected data type from read_data_from_gcs: {type(raw_data_container)}")
@@ -1265,153 +1659,247 @@ def process_object(object_name: str, target_dataset_id: str):
         base_filename_sanitized = sanitize_bq_name(os.path.splitext(os.path.basename(object_name))[0])
         overall_processed_table_count = 0
 
-        if not sheets_to_process_map: 
-            logger_worker.warning(f"No sheets/data found in {object_name}. Skipping."); 
+        if not sheets_to_process_map:
+            logger_worker.warning(f"No sheets/data found in {object_name}. Skipping.");
             return
 
         logger_worker.info(f"PROCESS_OBJECT_BEFORE_SHEET_LOOP: For {object_name}, sheets to process: {list(sheets_to_process_map.keys()) if sheets_to_process_map else 'None'}")
+
         for sheet_name, original_raw_sheet_df in sheets_to_process_map.items():
             logger_worker.info(f"PROCESS_OBJECT_SHEET_LOOP_ENTRY: For {object_name}, processing sheet: '{sheet_name}' (Shape: {original_raw_sheet_df.shape if original_raw_sheet_df is not None else 'None'})")
             if original_raw_sheet_df is None or original_raw_sheet_df.empty:
                 logger_worker.warning(f"Sheet '{sheet_name}' is empty or None. Skipping sheet.")
                 continue
-            
-            identified_tables_in_sheet = _find_all_tables_in_sheet(
+
+            identified_raw_blocks_in_sheet = _find_all_tables_in_sheet(
                 original_raw_sheet_df,
-                min_rows=WORKER_MIN_TABLE_ROWS, min_cols=WORKER_MIN_TABLE_COLS,
+                min_rows=WORKER_MIN_TABLE_ROWS,
+                min_cols=WORKER_MIN_TABLE_COLS,
                 block_density_threshold=WORKER_BLOCK_DENSITY_THRESHOLD,
                 header_confidence=WORKER_MIN_HEADER_CONFIDENCE
             )
 
-            if not identified_tables_in_sheet:
-                logger_worker.info(f"No distinct tables found in sheet '{sheet_name}'.")
+            if not identified_raw_blocks_in_sheet:
+                logger_worker.info(f"No distinct tables found in sheet '{sheet_name}' using block detection.")
                 continue
-            logger_worker.info(f"Found {len(identified_tables_in_sheet)} distinct table candidate(s) in sheet '{sheet_name}'.")
+            logger_worker.info(f"Found {len(identified_raw_blocks_in_sheet)} distinct raw table block(s) in sheet '{sheet_name}'.")
 
-            for table_data in identified_tables_in_sheet:
-                isolated_df_block = table_data['df'] 
-                table_suffix_id = table_data['id']
-                table_score = table_data['score']
-                logger_worker.info(f"--- Processing extracted table '{table_suffix_id}' from sheet '{sheet_name}' (Score: {table_score:.2f}, Shape: {isolated_df_block.shape}) ---")
+            for raw_table_block_data in identified_raw_blocks_in_sheet:
+                current_raw_block_df = raw_table_block_data['df']
+                table_suffix_id = raw_table_block_data['id']
+                log_block_prefix = f"Obj:{object_name},Sht:{sheet_name},Blk:{table_suffix_id}"
 
-                cleaned_df = clean_dataframe(isolated_df_block) # Pass the already isolated block
-                if cleaned_df.empty:
-                    logger_worker.warning(f"Table '{table_suffix_id}' from sheet '{sheet_name}' is empty after cleaning. Skipping.")
-                    all_processing_successful = False; continue
+                logger_worker.info(f"--- Processing {log_block_prefix} (Shape: {current_raw_block_df.shape}) ---")
+                cleaned_df: Optional[pd.DataFrame] = None
+                attempt_ai_processing = (
+                    is_multi_header_file and
+                    header_depth_from_user is not None and
+                    header_depth_from_user > 0 and
+                    GEMINI_SDK_AVAILABLE and WORKER_GEMINI_API_KEY
+                )
 
+                if attempt_ai_processing:
+                    logger_worker.info(f"{log_block_prefix}: Attempting HYBRID AI multi-header processing (depth={header_depth_from_user}).")
+                    
+                    # Ensure header_depth is not greater than block height
+                    actual_header_depth = min(header_depth_from_user, current_raw_block_df.shape[0])
+                    if actual_header_depth < 1:
+                        logger_worker.warning(f"{log_block_prefix}: Effective header depth for AI is < 1. Falling back to heuristic single-header.")
+                        cleaned_df = clean_dataframe(current_raw_block_df.copy())
+                    else:
+                        header_material = current_raw_block_df.iloc[:actual_header_depth, :].copy()
+                        data_material = current_raw_block_df.iloc[actual_header_depth:, :].copy().reset_index(drop=True)
+
+                        flattened_names = _get_flattened_headers_via_ai(
+                            header_material,
+                            actual_header_depth, # Pass the actual depth being used
+                            num_expected_cols=header_material.shape[1],
+                            file_context_for_log=log_block_prefix
+                        )
+
+                        if flattened_names: # AI succeeded and returned a valid list
+                            logger_worker.info(f"{log_block_prefix}: AI header processing successful. Applying names.")
+                            if data_material.empty and header_material.empty:
+                                 cleaned_df = pd.DataFrame()
+                            elif data_material.empty: # All rows were headers per AI
+                                 cleaned_df = pd.DataFrame(columns=flattened_names)
+                            else: # We have data and AI headers
+                                processed_df_with_ai_headers = data_material.copy()
+                                processed_df_with_ai_headers.columns = flattened_names
+                                cleaned_df = _clean_dataframe_pre_headered(processed_df_with_ai_headers)
+                        else: # AI failed
+                            logger_worker.warning(f"{log_block_prefix}: AI header processing failed. Falling back to heuristic single-header logic.")
+                            cleaned_df = clean_dataframe(current_raw_block_df.copy())
+                else: # AI processing not attempted (not enabled, no depth, or AI SDK unavailable)
+                    if is_multi_header_file and header_depth_from_user is not None and header_depth_from_user > 0:
+                        # AI was desired but couldn't run (e.g. no API key) - use best heuristic
+                        logger_worker.warning(f"{log_block_prefix}: AI processing for multi-header not available/configured. Attempting heuristic multi-header (V10 or similar).")
+                        # ---- INSERT YOUR BEST HEURISTIC MULTI-HEADER FUNCTION CALL HERE ----
+                        # For example, if _process_multi_header_block_v10 was your best heuristic:
+                        # heuristic_multi_header_df = _process_multi_header_block_v10(
+                        # current_raw_block_df.copy(),
+                        # header_depth_from_user,
+                        # # ... logging params ...
+                        # )
+                        # if heuristic_multi_header_df is not None:
+                        # cleaned_df = _clean_dataframe_pre_headered(heuristic_multi_header_df.copy())
+                        # else:
+                        # logger_worker.warning(f"{log_block_prefix}: Heuristic multi-header also failed. Fallback to simple.")
+                        # cleaned_df = clean_dataframe(current_raw_block_df.copy())
+                        # For now, falling back to simple clean_dataframe if AI can't run for multi-header
+                        logger_worker.info(f"{log_block_prefix}: Falling back to simple single-header due to AI unavailability for multi-header.")
+                        cleaned_df = clean_dataframe(current_raw_block_df.copy())
+                    else:
+                        # Standard single-header processing path
+                        logger_worker.info(f"{log_block_prefix}: Using standard single-header processing logic.")
+                        cleaned_df = clean_dataframe(current_raw_block_df.copy())
+                
+                if cleaned_df is None or cleaned_df.empty:
+                    logger_worker.warning(f"{log_block_prefix}: Table is empty or cleaning failed for (Block ID '{table_suffix_id}', Sheet '{sheet_name}'). Skipping.")
+                    continue
+
+                # --- BQ Table Naming Logic ---
                 sanitized_sheet_name_for_bq = sanitize_bq_name(sheet_name)
                 final_bq_table_name_parts = [base_filename_sanitized]
-                
-                if sheet_name != "_default_" or len(sheets_to_process_map) > 1 or (len(identified_tables_in_sheet) > 1 and sheet_name == "_default_"):
+                if sheet_name != "_default_" or \
+                   len(sheets_to_process_map) > 1 or \
+                   (len(identified_raw_blocks_in_sheet) > 1 and sheet_name == "_default_"):
                     final_bq_table_name_parts.append(sanitized_sheet_name_for_bq)
-                
-                if len(identified_tables_in_sheet) > 1:
+                if len(identified_raw_blocks_in_sheet) > 1:
                     final_bq_table_name_parts.append(sanitize_bq_name(table_suffix_id))
                 
-                final_bq_table_name = "_".join(part for part in final_bq_table_name_parts if part) 
+                final_bq_table_name = "_".join(part for part in final_bq_table_name_parts if part)
                 final_bq_table_name = final_bq_table_name[:1024]
                 bq_table_id_full = f"{WORKER_GCP_PROJECT}.{target_dataset_id}.{final_bq_table_name}"
                 logger_worker.info(f"Target BQ table for '{table_suffix_id}' from sheet '{sheet_name}': {bq_table_id_full}")
 
+                # --- Schema Determination, Alignment, and Load ---
                 try:
                     schema = determine_schema(cleaned_df, bq_table_id_full, WORKER_DEFAULT_SCHEMA_STRATEGY)
-                    if schema is None: 
+                    if schema is None:
                         logger_worker.error(f"Schema determination failed for {bq_table_id_full}. Skipping table.")
-                        all_processing_successful = False; continue
+                        all_processing_successful = False
+                        continue
                     
-                    aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema) # Pass copy
-                    if aligned_df.empty: 
-                        logger_worker.warning(f"DataFrame for {bq_table_id_full} empty after alignment. Skipping load.")
+                    aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema)
+                    
+                    if aligned_df.empty and not cleaned_df.empty:
+                        logger_worker.warning(f"DataFrame for {bq_table_id_full} became empty after alignment. Original cleaned shape: {cleaned_df.shape}. Skipping load.")
+                        continue
+                    elif aligned_df.empty and cleaned_df.empty:
+                        logger_worker.info(f"DataFrame for {bq_table_id_full} was already empty before alignment. Skipping load.")
                         continue
                     
                     load_to_bq(aligned_df, bq_table_id_full, schema, WORKER_DEFAULT_WRITE_DISPOSITION)
                     overall_processed_table_count += 1
                 except Exception as per_table_error:
-                    logger_worker.error(f"--- Error processing table '{table_suffix_id}' ({bq_table_id_full}) from sheet '{sheet_name}': {per_table_error} ---", exc_info=True)
+                    logger_worker.error(f"--- Error during BQ load phase for table '{final_bq_table_name}' ({bq_table_id_full}): {per_table_error} ---", exc_info=True)
                     all_processing_successful = False
-
+            # End loop for tables (blocks) within a sheet
+        # End loop for sheets
+        
+        # --- Final Summary Logging (same as before) ---
         if overall_processed_table_count > 0 and all_processing_successful: 
             logger_worker.info(f"--- Successfully processed all {overall_processed_table_count} table(s) from GCS: {object_name} -> {target_dataset_id} ---")
-        elif overall_processed_table_count > 0 and not all_processing_successful: 
-            logger_worker.warning(f"--- Partially processed GCS: {object_name} -> {target_dataset_id}. {overall_processed_table_count} table(s) loaded, errors on others. ---")
-        elif overall_processed_table_count == 0 and not sheets_to_process_map: 
-            logger_worker.info(f"--- Finished {object_name}: No data/sheets found. ---")
-        elif overall_processed_table_count == 0 and all_processing_successful: 
-            logger_worker.warning(f"--- Finished {object_name}: No valid tables found/loaded to {target_dataset_id}. ---")
-        else: # overall_processed_table_count == 0 and not all_processing_successful
-             logger_worker.error(f"--- Failed to process any tables successfully for GCS: {object_name} -> {target_dataset_id}. ---")
-             if sheets_to_process_map: # If sheets existed but yielded no tables due to errors
-                  raise Exception(f"Failed to process any table successfully for {object_name} despite data being present.")
+        # ... (other final summary log messages) ...
+        elif overall_processed_table_count == 0 and not all_processing_successful :
+             logger_worker.error(f"--- Failed to process any tables successfully for GCS: {object_name} -> {target_dataset_id} (likely due to pre-BQ load errors or AI failures). ---")
+             # Removed the raise Exception here to avoid NACKing if some sheets simply had no tables or AI failed but didn't crash.
+             # The all_processing_successful flag will indicate if any specific table load to BQ failed.
+        elif overall_processed_table_count == 0 and not sheets_to_process_map:
+            logger_worker.info(f"--- Finished {object_name}: No data/sheets found in the file. ---")
+        elif overall_processed_table_count == 0 and all_processing_successful:
+            logger_worker.warning(f"--- Finished {object_name}: No valid tables found or loaded to {target_dataset_id}. ---")
+
 
     except FileNotFoundError: 
-        logger_worker.warning(f"GCS object not found: '{object_name}'. Allowing ACK.")
-        return
+        logger_worker.warning(f"GCS object not found: '{object_name}'. Allowing ACK (no retry needed).")
+        return 
     except ImportError as imp_err: 
-        logger_worker.critical(f"PROCESS_OBJECT_IMPORT_ERROR: For {object_name}: {imp_err}. If 'scipy', multi-table detection failed.", exc_info=True)
+        logger_worker.critical(f"PROCESS_OBJECT_IMPORT_ERROR: For {object_name}: {imp_err}. Critical dependency missing.", exc_info=True)
         raise 
     except Exception as e:
-        logger_worker.error(f"PROCESS_OBJECT_CRITICAL_ERROR: For GCS object {object_name}, dataset {target_dataset_id}: {type(e).__name__} - {e}", exc_info=True)
+        logger_worker.error(f"PROCESS_OBJECT_CRITICAL_ERROR: Unhandled exception for GCS object {object_name}, dataset {target_dataset_id}: {type(e).__name__} - {e}", exc_info=True)
         raise
+# +++ END FULLY MODIFIED process_object +++
 
-
-
-
-
-
+# ... (callback function - ensure it passes is_multi_header, header_depth to process_object)
+# ... (main execution block)
 
 # +++ MODIFICATION END +++
+# etl.py
 
-# callback function remains UNCHANGED
-def callback(message):
-    object_name = None
-    target_dataset_id = None
+# ... (existing imports) ...
+
+def callback(message: Any): # Add type hint for message if possible (e.g., from google.cloud.pubsub_v1.subscriber.message import Message)
+    object_name: Optional[str] = None
+    target_dataset_id: Optional[str] = None
+    # +++ NEW: Initialize multi-header params +++
+    is_multi_header: Optional[bool] = False
+    header_depth: Optional[int] = None
+    # +++ END NEW +++
+
     raw_message_data = message.data
-    
-    # Initialize for logging, in case of early decode failure
-    object_name_for_log = "PRE_DECODE_UNKNOWN"
+    object_name_for_log = "PRE_DECODE_UNKNOWN" # Keep this for initial logging
     temp_object_name_for_log = "UNKNOWN_OBJECT_IN_CALLBACK" 
 
     try:
         message_str = raw_message_data.decode("utf-8")
         message_data = json.loads(message_str)
-        object_name = message_data.get("object_name")
         
-        # Update for logging after successful decode
+        object_name = message_data.get("object_name")
+        target_dataset_id = message_data.get("target_dataset_id")
+        # +++ NEW: Extract multi-header params from message +++
+        is_multi_header = message_data.get("is_multi_header", False) # Default to False if not present
+        header_depth_raw = message_data.get("header_depth")
+        if header_depth_raw is not None:
+            try:
+                header_depth = int(header_depth_raw)
+                if not (1 <= header_depth <= 10): # Match Pydantic validation
+                    logger_worker.warning(f"Received invalid header_depth {header_depth_raw} for {object_name}. Ignoring.")
+                    header_depth = None
+                    is_multi_header = False # Treat as single if depth is invalid
+            except ValueError:
+                logger_worker.warning(f"Received non-integer header_depth '{header_depth_raw}' for {object_name}. Ignoring.")
+                header_depth = None
+                is_multi_header = False # Treat as single if depth is invalid
+        # +++ END NEW +++
+        
         object_name_for_log = object_name or "OBJECT_NAME_MISSING_IN_JSON"
         temp_object_name_for_log = object_name_for_log
 
-        target_dataset_id = message_data.get("target_dataset_id")
-
-        # This critical log is now placed *after* attempting to decode object_name
         logger_worker.critical(f"LOCAL_CALLBACK_RECEIVED_MESSAGE_FOR: {object_name_for_log} | Thread: {threading.get_ident()}")
-        logger_worker.info(f"CALLBACK_ENTRY: Processing Pub/Sub message for object: {temp_object_name_for_log}, Target Dataset: {target_dataset_id}")
-
+        logger_worker.info(
+            f"CALLBACK_ENTRY: Processing Pub/Sub message for object: {temp_object_name_for_log}, "
+            f"Target Dataset: {target_dataset_id}, Multi-Header: {is_multi_header}, Depth: {header_depth}"
+        )
 
         if not object_name or not target_dataset_id:
             logger_worker.error(f"CALLBACK_ERROR: Invalid Pub/Sub message format for {temp_object_name_for_log}: Missing 'object_name' or 'target_dataset_id'. Data: {message_str}")
             message.nack()
             return
+        
+        # +++ NEW: Validate header_depth consistency with is_multi_header +++
+        if is_multi_header and header_depth is None:
+            logger_worker.error(f"CALLBACK_ERROR: Inconsistent message for {temp_object_name_for_log}: is_multi_header is True but header_depth is missing or invalid. Nacking.")
+            message.nack()
+            return
+        # +++ END NEW +++
 
-        process_object(object_name, target_dataset_id) # This is where the main work happens
+        # Pass new params to process_object
+        process_object(object_name, target_dataset_id, is_multi_header, header_depth) # MODIFIED
         
         message.ack()
         logger_worker.info(f"CALLBACK_SUCCESS: ACKed message for: {object_name}")
 
+    # ... (existing except blocks) ...
     except json.JSONDecodeError as json_err:
-        # object_name_for_log would still be "PRE_DECODE_UNKNOWN" or its initial value if json.loads fails
         logger_worker.error(f"CALLBACK_JSON_ERROR: For initial log name '{object_name_for_log}'. Failed to parse Pub/Sub message JSON: {json_err}. Raw Data: '{raw_message_data.decode('utf-8', errors='replace')}'")
         message.nack()
     except Exception as e:
-        # temp_object_name_for_log will hold the best guess for object_name
         logger_worker.exception(f"CALLBACK_CRITICAL_ERROR: For {temp_object_name_for_log}. Error: {e}")
         message.nack()
         logger_worker.info(f"CALLBACK_NACK: NACKed message for: {temp_object_name_for_log} due to critical error.")
-    # Note: The critical log "LOCAL_CALLBACK_RECEIVED_MESSAGE_FOR" is now inside the try block,
-    # so if json.loads fails, it won't print the decoded object_name. This is acceptable.
-    # If you need it outside, you'd have to handle the decode failure before it.
-
-
-
 
 
 
