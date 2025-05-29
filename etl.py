@@ -58,6 +58,7 @@ WORKER_GCS_BUCKET = os.getenv("GCS_BUCKET")
 WORKER_BQ_DATASET = os.getenv("BQ_DATASET")
 WORKER_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None)
 WORKER_PUBSUB_SUBSCRIPTION = os.getenv("PUBSUB_SUBSCRIPTION")
+BASE_URL = os.getenv("VITE_API_BASE_URL")
 # WORKER_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service-account.json") # Default filename
 
 WORKER_DEFAULT_SCHEMA_STRATEGY = os.getenv("SCHEMA_STRATEGY", "existing_or_gemini")
@@ -1626,8 +1627,16 @@ def process_object(
     object_name: str,
     target_dataset_id: str,
     is_multi_header_file: bool = False,
-    header_depth_from_user: Optional[int] = None
+    header_depth_from_user: Optional[int] = None,
+    batch_id: Optional[str] = None,
+    file_id: Optional[str] = None,
+    original_file_name: Optional[str] = None # Make sure this is used for reporting
 ):
+    log_context = f"Obj:{object_name}, Batch:{batch_id}, FileID:{file_id}"
+    logger_worker.info(f"--- Starting process_object for {log_context} (Multi-Header: {is_multi_header_file}, Depth: {header_depth_from_user}) ---")
+
+    processing_successful_internally = False # Tracks if the core logic succeeded
+    final_error_message: Optional[str] = "Processing did not complete as expected."
     logger_worker.critical(f"LOCAL_PROCESS_OBJECT_ENTRY_FOR: {object_name} | Thread: {threading.get_ident()}")
     logger_worker.info(
         f"--- Starting processing GCS object: {object_name} -> Target BQ Dataset: {target_dataset_id} "
@@ -1811,17 +1820,44 @@ def process_object(
         elif overall_processed_table_count == 0 and all_processing_successful:
             logger_worker.warning(f"--- Finished {object_name}: No valid tables found or loaded to {target_dataset_id}. ---")
 
+        if all_processing_successful: # Your existing flag that tracks success of all table loads
+            processing_successful_internally = True
+            final_error_message = None
+            if overall_processed_table_count == 0:
+                if not sheets_to_process_map:
+                    final_error_message = "No data/sheets found in the file." # Still success in terms of processing
+                else:
+                    final_error_message = "No valid tables found or loaded, though sheets were present." # Still success
+        else:
+            processing_successful_internally = False # Explicitly false if all_processing_successful is false
+            if overall_processed_table_count > 0:
+                final_error_message = f"Partially processed; {overall_processed_table_count} tables loaded, but errors occurred on others."
+            else:
+                final_error_message = "Failed to process or load any tables successfully due to errors."
 
-    except FileNotFoundError: 
-        logger_worker.warning(f"GCS object not found: '{object_name}'. Allowing ACK (no retry needed).")
-        return 
-    except ImportError as imp_err: 
-        logger_worker.critical(f"PROCESS_OBJECT_IMPORT_ERROR: For {object_name}: {imp_err}. Critical dependency missing.", exc_info=True)
-        raise 
+
+    except FileNotFoundError:
+        logger_worker.warning(f"GCS object not found during processing for {log_context}.")
+        final_error_message = "File not found in GCS."
+        processing_successful_internally = False # This is a file processing failure
+    except ImportError as imp_err:
+        logger_worker.critical(f"Critical ImportError in process_object for {log_context}: {imp_err}", exc_info=True)
+        final_error_message = f"ETL Worker missing critical dependency: {str(imp_err)}"
+        processing_successful_internally = False
+        raise # Re-raise critical infra errors after reporting in finally
     except Exception as e:
-        logger_worker.error(f"PROCESS_OBJECT_CRITICAL_ERROR: Unhandled exception for GCS object {object_name}, dataset {target_dataset_id}: {type(e).__name__} - {e}", exc_info=True)
-        raise
-# +++ END FULLY MODIFIED process_object +++
+        logger_worker.error(f"Unhandled Exception in process_object for {log_context}: {e}", exc_info=True)
+        final_error_message = f"Unhandled processing error: {str(e)}"
+        processing_successful_internally = False
+        raise # Re-raise other critical errors after reporting in finally
+    finally:
+        _report_completion_to_api(
+            batch_id, 
+            file_id, 
+            original_file_name or object_name, # Fallback to object_name if original_file_name somehow None
+            processing_successful_internally, 
+            final_error_message
+        )
 
 # ... (callback function - ensure it passes is_multi_header, header_depth to process_object)
 # ... (main execution block)
@@ -1837,6 +1873,9 @@ def callback(message: Any): # Add type hint for message if possible (e.g., from 
     # +++ NEW: Initialize multi-header params +++
     is_multi_header: Optional[bool] = False
     header_depth: Optional[int] = None
+    batch_id_from_msg: Optional[str] = None
+    file_id_from_msg: Optional[str] = None
+    original_file_name_from_msg: Optional[str] = None
     # +++ END NEW +++
 
     raw_message_data = message.data
@@ -1873,7 +1912,25 @@ def callback(message: Any): # Add type hint for message if possible (e.g., from 
             f"CALLBACK_ENTRY: Processing Pub/Sub message for object: {temp_object_name_for_log}, "
             f"Target Dataset: {target_dataset_id}, Multi-Header: {is_multi_header}, Depth: {header_depth}"
         )
-
+        batch_id_from_msg = message_data.get("batch_id")
+        file_id_from_msg = message_data.get("file_id")
+        original_file_name_from_msg = message_data.get("original_file_name") # Ensure this key matches what main.py sends
+        if not all([object_name, target_dataset_id, batch_id_from_msg, file_id_from_msg, original_file_name_from_msg]):
+             logger_worker.error(f"CALLBACK_ERROR: Missing critical fields in message. Nacking. Data: {message_data}")
+             message.nack()
+             return
+        if is_multi_header and header_depth is None: # (re-check header_depth parsing here)
+             header_depth_raw = message_data.get("header_depth")
+             if header_depth_raw is not None:
+                 try:
+                     header_depth = int(header_depth_raw)
+                     if not (1 <= header_depth <= 10): header_depth = None
+                 except ValueError: header_depth = None
+             if header_depth is None:
+                logger_worker.error(f"CALLBACK_ERROR: Multi-header TRUE but invalid/missing header_depth for {object_name}. Nacking.")
+                _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, "Invalid header_depth for multi-header mode.")
+                message.ack() # ACK because the message itself is bad, no point retrying. Worker reported error.
+                return
         if not object_name or not target_dataset_id:
             logger_worker.error(f"CALLBACK_ERROR: Invalid Pub/Sub message format for {temp_object_name_for_log}: Missing 'object_name' or 'target_dataset_id'. Data: {message_str}")
             message.nack()
@@ -1887,10 +1944,22 @@ def callback(message: Any): # Add type hint for message if possible (e.g., from 
         # +++ END NEW +++
 
         # Pass new params to process_object
-        process_object(object_name, target_dataset_id, is_multi_header, header_depth) # MODIFIED
+        process_object(
+            object_name, target_dataset_id, 
+            is_multi_header, header_depth,
+            batch_id_from_msg, file_id_from_msg, original_file_name_from_msg
+        )
         
         message.ack()
-        logger_worker.info(f"CALLBACK_SUCCESS: ACKed message for: {object_name}")
+        logger_worker.info(f"CALLBACK_SUCCESS: ACKed and initiated processing for Batch:{batch_id_from_msg}, FileID:{file_id_from_msg}")
+    except Exception as e: # Catch errors from json.loads or initial setup in callback
+        logger_worker.exception(f"Outer CALLBACK_CRITICAL_ERROR for object {object_name or 'Unknown'} (Batch: {batch_id_from_msg}, File: {file_id_from_msg}): {e}")
+        # Try to report this callback-level failure if we have IDs
+        if batch_id_from_msg and file_id_from_msg and original_file_name_from_msg:
+            _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, f"Callback error: {str(e)}")
+            message.ack() # ACK because we reported it, prevent retry loops for malformed messages
+        else:
+            message.nack() # NACK if we don't have enough info to report
 
     # ... (existing except blocks) ...
     except json.JSONDecodeError as json_err:
@@ -1901,7 +1970,36 @@ def callback(message: Any): # Add type hint for message if possible (e.g., from 
         message.nack()
         logger_worker.info(f"CALLBACK_NACK: NACKed message for: {temp_object_name_for_log} due to critical error.")
 
+def _report_completion_to_api(
+    batch_id: str, 
+    file_id: str, 
+    original_file_name: str, 
+    success: bool, 
+    error_msg: Optional[str]
+):
+    if not batch_id or not file_id or not original_file_name:
+        logger_worker.error(f"Cannot report completion for {original_file_name}: Missing tracking IDs.")
+        return
 
+    report_url = f"{BASE_URL}/api/internal/etl-file-completed"
+    payload = {
+        "batch_id": batch_id,
+        "file_id": file_id,
+        "original_file_name": original_file_name,
+        "success": success,
+        "error_message": error_msg
+    }
+    # headers = {"X-Worker-API-Key": WORKER_INTERNAL_API_KEY} # If using API key
+
+    try:
+        logger_worker.info(f"Reporting completion to API for FileID {file_id} in Batch {batch_id}. Success: {success}. Payload: {payload}")
+        response = requests.post(report_url, json=payload, timeout=20) # headers=headers
+        response.raise_for_status()
+        logger_worker.info(f"Successfully reported completion for FileID {file_id} to API. Status: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        logger_worker.error(f"Failed to report completion for FileID {file_id} to API: {e}", exc_info=True)
+    except Exception as e_unexp:
+        logger_worker.error(f"Unexpected error reporting completion for FileID {file_id}: {e_unexp}", exc_info=True)
 
 # Main execution block remains UNCHANGED
 if __name__ == "__main__":
