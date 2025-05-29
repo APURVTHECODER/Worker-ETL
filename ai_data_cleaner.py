@@ -4,13 +4,20 @@ import json
 import re
 import logging
 from typing import List, Optional, Any
+import time # +++ ADDED +++
 
 # Attempt to import google.generativeai
 try:
     import google.generativeai as genai
+    import google.api_core.exceptions # +++ ADDED for specific exception handling +++
     GEMINI_SDK_AVAILABLE_CLEANER = True
 except ImportError:
     GEMINI_SDK_AVAILABLE_CLEANER = False
+    # Mock classes for when SDK is not available
+    class MockGoogleAPICoreExceptions: # +++ ADDED +++
+        ResourceExhausted = type('ResourceExhausted', (Exception,), {})
+    google = type('MockGoogleModule', (), {'api_core': type('MockAPICoreModule', (), {'exceptions': MockGoogleAPICoreExceptions})})() # +++ ADDED +++
+
     class MockGenerativeModel:
         def generate_content(self, *args, **kwargs):
             raise NotImplementedError("Gemini SDK not available.")
@@ -18,93 +25,127 @@ except ImportError:
         GenerativeModel = MockGenerativeModel
     genai = MockGenAI()
 
-logger_worker = logging.getLogger(__name__ + "_ai_cleaner")
-# Logging setup remains as is, assuming main etl.py configures it.
 
-# +++ MODIFIED IMPORT +++
+logger_worker = logging.getLogger(__name__ + "_ai_cleaner")
+
 try:
-    from worker_config import WORKER_GEMINI_TIMEOUT, MAX_SAMPLE_SIZE_FOR_AI_CLEANING
-    # You might also want to import WORKER_GEMINI_API_KEY from worker_config if you centralize its check
-    # from worker_config import WORKER_GEMINI_API_KEY, GEMINI_SDK_AVAILABLE (if you also move GEMINI_SDK_AVAILABLE to config)
+    # +++ MODIFIED IMPORT: Add GEMINI_API_RATE_LIMITER +++
+    from worker_config import WORKER_GEMINI_TIMEOUT, MAX_SAMPLE_SIZE_FOR_AI_CLEANING, GEMINI_API_RATE_LIMITER
     logger_worker.debug("Successfully imported configurations from worker_config.py")
 except ImportError as e:
     logger_worker.error(f"CRITICAL: Failed to import from worker_config.py: {e}. Using fallback defaults.")
-    WORKER_GEMINI_TIMEOUT = 60  # Fallback
-    MAX_SAMPLE_SIZE_FOR_AI_CLEANING = 20 # Fallback
-# +++ END MODIFIED IMPORT +++
+    WORKER_GEMINI_TIMEOUT = 60
+    MAX_SAMPLE_SIZE_FOR_AI_CLEANING = 20
+    # Fallback rate limiter (effectively disabled or very permissive if config fails)
+    class APIRateLimiter:
+        def __init__(self, requests_per_minute: int): self.min_interval_seconds = 0
+        def wait_if_needed(self, logger_instance=None): pass
+    GEMINI_API_RATE_LIMITER = APIRateLimiter(1000) # Fallback
 
 
 def _call_gemini_for_cleaning(prompt: str, column_name: str, cleaning_type: str) -> Optional[List[str]]:
-    """
-    Helper to call Gemini API for data cleaning tasks.
-    Returns a list of processed strings or None on failure.
-    """
-    if not GEMINI_SDK_AVAILABLE_CLEANER: # This check is local to this file now
+    if not GEMINI_SDK_AVAILABLE_CLEANER:
         logger_worker.error(f"Gemini SDK not available. Cannot perform AI cleaning for '{column_name}' ({cleaning_type}).")
         return None
     
-    # API Key check: This assumes genai.configure() has been called with the API key in etl.py's startup.
-    # If WORKER_GEMINI_API_KEY is imported from worker_config, you could add:
-    # from worker_config import WORKER_GEMINI_API_KEY
-    # if not WORKER_GEMINI_API_KEY:
-    #     logger_worker.error("Gemini API Key not configured. Cannot perform AI cleaning.")
-    #     return None
+    # API Key is configured in etl.py via genai.configure()
 
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        logger_worker.debug(f"Sending AI cleaning request for '{column_name}' ({cleaning_type}). Prompt (start): {prompt[:200]}...")
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.1,
-                response_mime_type="application/json"
-            ),
-            # Use the imported WORKER_GEMINI_TIMEOUT
-            request_options={'timeout': WORKER_GEMINI_TIMEOUT // 2}
-        )
-        # ... (rest of _call_gemini_for_cleaning remains the same)
-        if not response.parts:
-            block_reason_msg = "Response from AI was empty or blocked."
-            if hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
-                block_reason_msg = f"AI request blocked. Reason: {getattr(response.prompt_feedback, 'block_reason_message', str(response.prompt_feedback.block_reason))}"
-            logger_worker.error(f"AI cleaning for column '{column_name}' ({cleaning_type}) failed: {block_reason_msg}")
-            logger_worker.debug(f"Full AI response object for '{column_name}': {response}")
-            return None
-        generated_json_text = response.text.strip()
-        if generated_json_text.startswith("```json"):
-           generated_json_text = generated_json_text[len("```json"):].strip()
-        if generated_json_text.endswith("```"):
-           generated_json_text = generated_json_text[:-len("```")].strip()
-        if not generated_json_text:
-            logger_worker.warning(f"AI for '{column_name}' ({cleaning_type}) returned empty content after stripping potential markdown.")
-            return None
-        cleaned_values = json.loads(generated_json_text)
-        if not isinstance(cleaned_values, list):
-            logger_worker.error(f"AI output for '{column_name}' ({cleaning_type}) was not a JSON list. Got: {type(cleaned_values)}. Raw: {generated_json_text[:200]}")
-            return None
-        if not all(isinstance(v, (str, type(None))) for v in cleaned_values):
-            logger_worker.error(f"AI output list for '{column_name}' ({cleaning_type}) does not contain all strings or nulls. Sample: {str(cleaned_values[:5])[:200]}. Raw: {generated_json_text[:200]}")
-            return None
-        return [str(v) if v is not None else "" for v in cleaned_values]
-    except json.JSONDecodeError as e:
-        # Note: if response is not defined due to an early error, response.text will fail.
-        # It's better to log the raw text if available, otherwise just the error.
-        raw_text_for_log = "N/A"
-        if 'response' in locals() and hasattr(response, 'text'):
-            raw_text_for_log = response.text[:500]
-        logger_worker.error(f"Failed to parse JSON from AI for '{column_name}' ({cleaning_type}): {e}. Raw Response (start): {raw_text_for_log}")
-    except AttributeError as ae:
-        if 'NoneType' in str(ae) and 'default_api_key' in str(ae).lower():
-             logger_worker.critical(f"Gemini API Key not configured (genai.configure() likely not called). AI cleaning for '{column_name}' failed. Error: {ae}")
-        else:
-             logger_worker.error(f"AttributeError during AI call for '{column_name}' ({cleaning_type}): {ae}", exc_info=True)
-    except Exception as e:
-        logger_worker.error(f"Error during AI cleaning call for '{column_name}' ({cleaning_type}): {e}", exc_info=True)
+    # +++ ADD Rate Limiter Wait +++
+    GEMINI_API_RATE_LIMITER.wait_if_needed(logger_worker)
+
+    # The SDK has built-in retries for 429s.
+    # We add a loop here mainly for logging and potentially a slightly more aggressive initial wait
+    # if the API is consistently overloaded, but primarily rely on SDK's retry for the actual retry logic.
+    max_sdk_retries_observed = 2 # How many times we'll let the SDK retry and log it before giving up from this func's perspective
+    
+    for attempt in range(max_sdk_retries_observed):
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash-latest')
+            logger_worker.debug(f"Sending AI cleaning request (attempt {attempt + 1}) for '{column_name}' ({cleaning_type}). Prompt (start): {prompt[:200]}...")
+            
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,
+                    response_mime_type="application/json"
+                ),
+                request_options={'timeout': WORKER_GEMINI_TIMEOUT // 2} # Timeout for a single attempt
+            )
+            
+            if not response.parts:
+                block_reason_msg = "Response from AI was empty or blocked."
+                if hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
+                    block_reason_msg = f"AI request blocked. Reason: {getattr(response.prompt_feedback, 'block_reason_message', str(response.prompt_feedback.block_reason))}"
+                logger_worker.error(f"AI cleaning for column '{column_name}' ({cleaning_type}) failed: {block_reason_msg}")
+                logger_worker.debug(f"Full AI response object for '{column_name}': {response}")
+                return None # Non-retryable error from our perspective here
+
+            generated_json_text = response.text.strip()
+            # ... (rest of JSON parsing as before)
+            if generated_json_text.startswith("```json"):
+               generated_json_text = generated_json_text[len("```json"):].strip()
+            if generated_json_text.endswith("```"):
+               generated_json_text = generated_json_text[:-len("```")].strip()
+            if not generated_json_text:
+                logger_worker.warning(f"AI for '{column_name}' ({cleaning_type}) returned empty content after stripping potential markdown.")
+                return None
+            cleaned_values = json.loads(generated_json_text)
+            if not isinstance(cleaned_values, list):
+                logger_worker.error(f"AI output for '{column_name}' ({cleaning_type}) was not a JSON list. Got: {type(cleaned_values)}. Raw: {generated_json_text[:200]}")
+                return None
+            if not all(isinstance(v, (str, type(None))) for v in cleaned_values): # Allow None for nulls
+                logger_worker.error(f"AI output list for '{column_name}' ({cleaning_type}) does not contain all strings or nulls. Sample: {str(cleaned_values[:5])[:200]}. Raw: {generated_json_text[:200]}")
+                return None
+            
+            return [str(v) if v is not None else "" for v in cleaned_values] # SUCCESS
+
+        except google.api_core.exceptions.ResourceExhausted as e:
+            logger_worker.warning(f"AI cleaning (SDK call attempt {attempt + 1}) for '{column_name}' ({cleaning_type}) hit ResourceExhausted (429): {e}")
+            # The SDK's retry mechanism should handle sleeping based on `retry_delay` from the error.
+            # If we are here, it means the SDK's retry for this *single* call might have exhausted or
+            # this is an outer loop. Let's log and if it's the last attempt of *our* loop, let it fail.
+            if attempt < max_sdk_retries_observed - 1:
+                # The SDK will retry internally with its own backoff. 
+                # Our proactive rate limiter should prevent most of these for *new* calls.
+                # If a call still gets 429, the SDK will handle the retry with delay.
+                # No explicit sleep here needed *if relying on SDK retry*.
+                # However, the log shows the error bubbling up, so SDK retries might have been exhausted for that call.
+                # Let's add a small delay to give the API a breather before *our* next conceptual attempt
+                # if the error bubbles up to this level.
+                delay_match = re.search(r"retry_delay {\s*seconds: (\d+)\s*}", str(e))
+                custom_delay = int(delay_match.group(1)) if delay_match else 10 * (attempt + 1)
+                logger_worker.info(f"Waiting {custom_delay}s before this function considers retrying the operation for '{column_name}'.")
+                time.sleep(custom_delay)
+                continue 
+            else:
+                logger_worker.error(f"AI cleaning for '{column_name}' failed after observing SDK retries due to ResourceExhausted.")
+                return None
+        except json.JSONDecodeError as e:
+            raw_text_for_log = "N/A"
+            if 'response' in locals() and hasattr(response, 'text'): raw_text_for_log = response.text[:500]
+            logger_worker.error(f"Failed to parse JSON from AI for '{column_name}' ({cleaning_type}): {e}. Raw Response (start): {raw_text_for_log}")
+            return None # Not retryable here
+        except AttributeError as ae:
+            if 'NoneType' in str(ae) and 'default_api_key' in str(ae).lower():
+                 logger_worker.critical(f"Gemini API Key not configured. AI cleaning for '{column_name}' failed. Error: {ae}")
+            else:
+                 logger_worker.error(f"AttributeError during AI call for '{column_name}' ({cleaning_type}): {ae}", exc_info=True)
+            return None # Not retryable here
+        except Exception as e:
+            logger_worker.error(f"Error during AI cleaning call (attempt {attempt+1}) for '{column_name}' ({cleaning_type}): {e}", exc_info=True)
+            # For other potentially transient errors, could add a small delay and retry
+            if attempt < max_sdk_retries_observed - 1:
+                time.sleep(5 * (attempt + 1)) 
+                continue
+            return None # General failure after retries
+
+    logger_worker.error(f"AI cleaning for '{column_name}' ({cleaning_type}) failed after all attempts in _call_gemini_for_cleaning.")
     return None
 
 
-# ... (ai_standardize_dates and ai_normalize_text functions remain the same,
-#      they already use MAX_SAMPLE_SIZE_FOR_AI_CLEANING which is now imported from worker_config)
+# Functions ai_standardize_dates and ai_normalize_text remain structurally the same,
+# as they call _call_gemini_for_cleaning which now has the rate limiter.
+# ... (ai_standardize_dates and ai_normalize_text as before)
 def ai_standardize_dates(column_series: pd.Series, column_name: str) -> pd.Series:
     # ... (uses MAX_SAMPLE_SIZE_FOR_AI_CLEANING) ...
     # (no change to the body of this function needed, only its import of MAX_SAMPLE_SIZE_FOR_AI_CLEANING via worker_config)
@@ -155,8 +196,6 @@ def ai_standardize_dates(column_series: pd.Series, column_name: str) -> pd.Serie
         return column_series
 
 def ai_normalize_text(column_series: pd.Series, column_name: str, mode: str = "title_case_trim") -> pd.Series:
-    # ... (uses MAX_SAMPLE_SIZE_FOR_AI_CLEANING) ...
-    # (no change to the body of this function needed)
     if column_series.empty or column_series.isnull().all():
         logger_worker.debug(f"Skipping AI text normalization for '{column_name}': series is empty or all null.")
         return column_series

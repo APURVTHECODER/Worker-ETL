@@ -7,7 +7,17 @@ import json
 import re
 import logging
 import pandas as pd
+try:
+    import google.generativeai as genai
+    import google.api_core.exceptions # For specific exception handling
+    GEMINI_SDK_AVAILABLE_CLEANER = True
+except ImportError:
+    GEMINI_SDK_AVAILABLE_CLEANER = False
+    # Mock classes for when SDK is not available
+    class MockGoogleAPICoreExceptions:
+        ResourceExhausted = type('ResourceExhausted', (Exception,), {})
 import requests
+import time
 import base64
 import atexit
 from google.oauth2 import service_account
@@ -53,6 +63,7 @@ try:
     from worker_config import (
         WORKER_GEMINI_API_KEY, # For genai.configure and other direct uses
         WORKER_GEMINI_TIMEOUT, # For direct schema inference if done in etl.py
+        GEMINI_API_RATE_LIMITER,
         # Add any other WORKER_ constants that etl.py directly uses
         # For example, if schema inference with Gemini is done in etl.py:
         # WORKER_GEMINI_SAMPLE_SIZE,
@@ -114,6 +125,11 @@ try:
 except ImportError:
     logger_worker.warning("Google Generative AI SDK not installed. AI features disabled.")
     GEMINI_SDK_AVAILABLE = False
+    # Fallback rate limiter
+    class APIRateLimiter: # Define a fallback if import fails
+        def __init__(self, requests_per_minute: int): self.min_interval_seconds = 0
+        def wait_if_needed(self, logger_instance=None): pass
+    GEMINI_API_RATE_LIMITER = APIRateLimiter(1000)
 # --- Input Validation for Worker (Corrected) ---
 required_vars = {
     "GCP_PROJECT": WORKER_GCP_PROJECT, "GCS_BUCKET": WORKER_GCS_BUCKET,
@@ -848,101 +864,132 @@ def infer_schema_gemini(df: pd.DataFrame) -> list | None:
             }
         }
     headers = {"Content-Type": "application/json"}
+    max_retries = 3
+    single_attempt_timeout = max(15, WORKER_GEMINI_TIMEOUT // (max_retries + 0.5)) # Ensure at least 15s, distribute overall timeout
     result = None
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=WORKER_GEMINI_TIMEOUT)
-        response.raise_for_status() # Check for HTTP errors
-        result = response.json()
-
-        if not result or not result.get("candidates"):
-            raise ValueError("Invalid Gemini response format: missing 'candidates'.")
-
-        # Extract text content reliably
+    for attempt in range(max_retries):
+        # +++ ADD Rate Limiter Wait +++
+        GEMINI_API_RATE_LIMITER.wait_if_needed(logger_worker)
+        logger_worker.info(f"Sending Gemini schema inference request (attempt {attempt + 1}/{max_retries})...")
         try:
-            schema_content = result["candidates"][0]["content"]["parts"][0]["text"]
-        except (IndexError, KeyError, TypeError) as e:
-            raise ValueError(f"Could not extract schema text from Gemini response: {e}. Response: {result}")
+            response = requests.post(url, headers=headers, json=payload, timeout=single_attempt_timeout)
 
-        if not schema_content:
-            raise ValueError("Gemini response text part is empty.")
+            if response.status_code == 429:
+                logger_worker.warning(
+                    f"Attempt {attempt + 1}/{max_retries}: Gemini API (schema inference) returned 429. "
+                    f"Body: {response.text[:200]}"
+                )
+                retry_after_seconds = 5 * (2**attempt) # Default exponential backoff
+                
+                if 'Retry-After' in response.headers: # HTTP standard header
+                    delay_val = response.headers['Retry-After']
+                    if delay_val.isdigit():
+                        retry_after_seconds = int(delay_val)
+                        logger_worker.info(f"API suggests Retry-After: {retry_after_seconds} seconds via header.")
+                else: # Check JSON body for Gemini-specific details (less common for simple HTTP)
+                    try:
+                        error_data = response.json()
+                        if "error" in error_data and "message" in error_data["error"]:
+                            msg = error_data["error"]["message"]
+                            match_msg_delay = re.search(r"retry_delay.*?seconds:\s*(\d+)", msg, re.IGNORECASE) # Look for seconds
+                            if match_msg_delay:
+                                retry_after_seconds = int(match_msg_delay.group(1))
+                                logger_worker.info(f"API suggests retry_delay of {retry_after_seconds}s in message.")
+                            else: # Check for retry after specific time
+                                match_ts_delay = re.search(r"Retry after (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)", msg, re.IGNORECASE)
+                                if match_ts_delay:
+                                    logger_worker.info(f"API message suggests retry after timestamp: {match_ts_delay.group(1)}. Using larger fixed delay (60s).")
+                                    retry_after_seconds = 60 
+                    except json.JSONDecodeError:
+                        logger_worker.warning("Could not parse 429 JSON response body for retry details during schema inference.")
+                    except Exception as parse_err:
+                        logger_worker.warning(f"Error parsing 429 retry details for schema inference: {parse_err}")
+                
+                if attempt < max_retries - 1:
+                    wait_this_time = max(retry_after_seconds, 1) # Ensure at least 1s wait
+                    logger_worker.info(f"Waiting {wait_this_time} seconds before retrying schema inference...")
+                    time.sleep(wait_this_time)
+                    continue 
+                else:
+                    logger_worker.error("Max retries reached for schema inference after 429.")
+                    # Raise a clear error or return None
+                    raise requests.exceptions.HTTPError("Max retries for schema inference (429)", response=response) from None
 
-        # Parse the JSON string (handle potential markdown)
-        try:
-            schema_list = json.loads(schema_content)
-        except json.JSONDecodeError:
-            # Attempt to clean markdown ```json ... ``` if present
-            cleaned_content = re.sub(r"```json\s*([\s\S]*?)\s*```", r"\1", schema_content, flags=re.IGNORECASE).strip()
+            response.raise_for_status() # Check for other HTTP errors (4xx, 5xx)
+            result = response.json()
+
+            # ... (rest of existing success processing for infer_schema_gemini)
+            if not result or not result.get("candidates"):
+                raise ValueError("Invalid Gemini response format: missing 'candidates'.")
             try:
-                schema_list = json.loads(cleaned_content)
-            except json.JSONDecodeError as json_err_cleaned:
-                 logger_worker.error(f"Failed to parse Gemini JSON even after cleaning markdown: {json_err_cleaned}")
-                 logger_worker.debug(f"Original Gemini Text: {schema_content}")
-                 raise ValueError("Gemini response was not valid JSON.") from json_err_cleaned
+                schema_content = result["candidates"][0]["content"]["parts"][0]["text"]
+            except (IndexError, KeyError, TypeError) as e:
+                raise ValueError(f"Could not extract schema text from Gemini response: {e}. Response: {result}")
+            if not schema_content:
+                raise ValueError("Gemini response text part is empty.")
+            try:
+                schema_list = json.loads(schema_content)
+            except json.JSONDecodeError:
+                cleaned_content = re.sub(r"```json\s*([\s\S]*?)\s*```", r"\1", schema_content, flags=re.IGNORECASE).strip()
+                try:
+                    schema_list = json.loads(cleaned_content)
+                except json.JSONDecodeError as json_err_cleaned:
+                     logger_worker.error(f"Failed to parse Gemini JSON even after cleaning markdown: {json_err_cleaned}")
+                     logger_worker.debug(f"Original Gemini Text: {schema_content}")
+                     raise ValueError("Gemini response was not valid JSON.") from json_err_cleaned
+            if not isinstance(schema_list, list):
+                raise ValueError(f"Gemini result is not a JSON list. Got: {type(schema_list)}")
+            if not schema_list:
+                raise ValueError("Gemini returned an empty list.")
+            validated_schema = []
+            valid_bq_types = {"STRING", "BYTES", "INTEGER", "INT64", "FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC", "BOOLEAN", "BOOL", "TIMESTAMP", "DATE", "TIME", "DATETIME", "GEOGRAPHY", "JSON", "INTERVAL"}
+            input_cols = set(df.columns)
+            for item in schema_list:
+                 if not isinstance(item, dict) or 'name' not in item or 'type' not in item:
+                     raise ValueError(f"Invalid schema item format from Gemini: {item}")
+                 name = item.get("name")
+                 type_val = item.get("type")
+                 if not isinstance(name, str) or not isinstance(type_val, str) or not name or not type_val:
+                     raise ValueError(f"Invalid name/type in schema item from Gemini: name='{name}', type='{type_val}'")
+                 if name not in input_cols:
+                     logger_worker.warning(f"Gemini suggested schema name '{name}' which is not in the original DataFrame columns. Skipping this field.")
+                     continue
+                 bq_type = type_val.upper()
+                 if bq_type not in valid_bq_types:
+                     logger_worker.warning(f"Gemini suggested invalid BigQuery type '{type_val}' for column '{name}'. Defaulting to STRING.")
+                     bq_type = "STRING"
+                 validated_schema.append({"name": name, "type": bq_type})
+            if not validated_schema:
+                 raise ValueError("Gemini schema generation failed: No valid schema fields matching input columns were produced.")
+            logger_worker.info(f"✅ Successfully validated Gemini schema for {len(validated_schema)} columns.")
+            logger_worker.debug(f"Validated Gemini Schema: {json.dumps(validated_schema)}")
+            return validated_schema # SUCCESS
 
+        except requests.exceptions.Timeout:
+            logger_worker.error(f"Gemini API call (attempt {attempt + 1}) for schema inference timed out after {single_attempt_timeout}s.")
+            if attempt == max_retries - 1:
+                logger_worker.error("Max retries reached for schema inference due to timeout.")
+                return None # Or raise
+        except requests.exceptions.RequestException as e: # Catches HTTPError from raise_for_status too
+            logger_worker.error(f"Gemini API request failed (attempt {attempt + 1}) for schema inference: {e}")
+            if e.response is not None:
+                logger_worker.error(f"Gemini Response Status: {e.response.status_code}, Body: {e.response.text[:500]}")
+            if attempt == max_retries - 1: # If this was the last attempt
+                logger_worker.error("Max retries reached for schema inference due to RequestException.")
+                return None # Or raise
+        except ValueError as e: # Catch our specific validation errors from JSON parsing/validation
+            logger_worker.error(f"Error processing/validating Gemini response for schema: {e}")
+            return None # Not retryable from here
+        except Exception as e: # Catch-all for unexpected errors during an attempt
+            logger_worker.exception(f"An unexpected error occurred during Gemini schema inference (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:
+                return None # Or raise
+        
+        # If we are here, it means a retryable error occurred, and we are not on the last attempt yet.
+        # The 'continue' for 429 or loop progression for Timeout/RequestException (if not last attempt) will handle retry.
 
-        # Validate the structure and content of the parsed list
-        if not isinstance(schema_list, list):
-            raise ValueError(f"Gemini result is not a JSON list. Got: {type(schema_list)}")
-        if not schema_list:
-            raise ValueError("Gemini returned an empty list.")
-
-        validated_schema = []
-        valid_bq_types = {
-            "STRING", "BYTES", "INTEGER", "INT64", "FLOAT", "FLOAT64",
-            "NUMERIC", "BIGNUMERIC", "BOOLEAN", "BOOL", "TIMESTAMP", "DATE",
-            "TIME", "DATETIME", "GEOGRAPHY", "JSON", "INTERVAL"
-        }
-        input_cols = set(df.columns) # Original columns from the dataframe
-
-        for item in schema_list:
-             # Validate item structure
-             if not isinstance(item, dict) or 'name' not in item or 'type' not in item:
-                 raise ValueError(f"Invalid schema item format from Gemini: {item}")
-
-             name = item.get("name")
-             type_val = item.get("type")
-
-             # Validate name and type content
-             if not isinstance(name, str) or not isinstance(type_val, str) or not name or not type_val:
-                 raise ValueError(f"Invalid name/type in schema item from Gemini: name='{name}', type='{type_val}'")
-
-             # Check if the name from Gemini matches an input column (important!)
-             if name not in input_cols:
-                 # This is a potential issue, Gemini hallucinated a column or used a sanitized name
-                 logger_worker.warning(f"Gemini suggested schema name '{name}' which is not in the original DataFrame columns. Skipping this field.")
-                 continue # Skip this field as it doesn't match input
-
-             bq_type = type_val.upper()
-             # Validate BQ type and default to STRING if invalid
-             if bq_type not in valid_bq_types:
-                 logger_worker.warning(f"Gemini suggested invalid BigQuery type '{type_val}' for column '{name}'. Defaulting to STRING.")
-                 bq_type = "STRING"
-
-             # Append validated field (name comes from Gemini but must match input)
-             validated_schema.append({"name": name, "type": bq_type})
-
-        # Final check: ensure we have at least one valid field matching input
-        if not validated_schema:
-             raise ValueError("Gemini schema generation failed: No valid schema fields matching input columns were produced.")
-
-        logger_worker.info(f"✅ Successfully validated Gemini schema for {len(validated_schema)} columns.")
-        logger_worker.debug(f"Validated Gemini Schema: {json.dumps(validated_schema)}")
-        return validated_schema
-
-    # --- Error Handling ---
-    except requests.exceptions.Timeout:
-        logger_worker.error(f"Gemini API call timed out after {WORKER_GEMINI_TIMEOUT} seconds.")
-    except requests.exceptions.RequestException as e:
-        # Includes connection errors, HTTP errors (like 4xx, 5xx)
-        logger_worker.error(f"Gemini API request failed: {e}")
-        if e.response is not None:
-            logger_worker.error(f"Gemini Response Status: {e.response.status_code}, Body: {e.response.text[:500]}") # Log response details if available
-    except ValueError as e: # Catch our specific validation errors
-        logger_worker.error(f"Error processing Gemini response: {e}")
-    except Exception as e: # Catch-all for unexpected errors
-        logger_worker.exception(f"An unexpected error occurred during Gemini schema inference: {e}") # Use exception to get traceback
-
-    return None # Return None if any error occurred
+    logger_worker.error("Schema inference failed after all retries.") # Should only be reached if all retries for retryable errors failed
+    return None
 
 # infer_schema_pandas function remains UNCHANGED
 def infer_schema_pandas(df: pd.DataFrame) -> list:
@@ -1377,6 +1424,14 @@ def _header_df_to_csv_string(df: pd.DataFrame) -> str:
 # ... (_clean_header_cell_text and _header_df_to_csv_string functions) ...
 
 # +++ AI-POWERED HEADER FLATTENING FUNCTION - WITH ACTUAL GEMINI CALL +++
+
+
+def _header_df_to_csv_string(df: pd.DataFrame) -> str:
+    """Converts a header DataFrame to a simple CSV string for the AI prompt."""
+    return df.fillna('').to_csv(header=False, index=False)
+# --- End Mock objects ---
+
+
 def _get_flattened_headers_via_ai(
     header_material_df: pd.DataFrame,
     header_depth: int, # User specified depth
@@ -1386,17 +1441,14 @@ def _get_flattened_headers_via_ai(
     log_prefix = f"AIHeaderFlatten ({file_context_for_log}, Depth: {header_depth})"
     logger_worker.info(f"{log_prefix}: Attempting to get flattened headers via AI.")
 
-    # Check for SDK and API Key should already be done by `attempt_ai_processing`
-    # but an extra guard here is fine.
     if not GEMINI_SDK_AVAILABLE or not WORKER_GEMINI_API_KEY:
         logger_worker.error(f"{log_prefix}: Gemini SDK or API key not available. Cannot use AI for headers.")
         return None
 
+    # --- Main try block for the entire function's operation ---
     try:
         header_csv_string = _header_df_to_csv_string(header_material_df)
         
-        # Few-shot examples should be part of the prompt string itself
-        # Ensure examples cover your 2-level and 3-level cases accurately
         prompt = f"""You are an expert Excel header interpreter.
 Given the following header rows (provided as CSV string, {header_depth} rows deep) and the number of original columns ({num_expected_cols}):
 <header_csv_start>
@@ -1436,84 +1488,107 @@ Now, process the provided header_csv_start/end block for {num_expected_cols} col
 """
         logger_worker.debug(f"{log_prefix}: AI Prompt (first 500 chars):\n{prompt[:500]}")
         logger_worker.debug(f"{log_prefix}: Full Header CSV for AI:\n{header_csv_string}")
-
-
-        # --- ACTUAL GEMINI API CALL ---
-        model = genai.GenerativeModel('gemini-1.5-flash-latest') # Or 'gemini-1.0-pro' if flash struggles
         
-        # Safety settings can be useful to prevent harmful or off-topic responses,
-        # though less critical for this structured task.
-        # safety_settings = [
-        #     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        #     {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        #     {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        #     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-        # ]
+        GEMINI_API_RATE_LIMITER.wait_if_needed(logger_worker)
 
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.1, # Low temperature for more deterministic/structured output
-                response_mime_type="application/json" # Request JSON directly
-            ),
-            # safety_settings=safety_settings, # Optional
-            request_options={'timeout': WORKER_GEMINI_TIMEOUT // 2} # Use a shorter timeout than for schema inference
-        )
-        # --- END ACTUAL GEMINI API CALL ---
-        logger_worker.debug(f"{log_prefix}: AI Raw Response Text (from response.text): {response.text if hasattr(response, 'text') else 'No text attribute'}")
-        logger_worker.debug(f"{log_prefix}: AI Raw Response Text: {response.text}")
-        
-        # It's good practice to check if response.parts exists and is not empty
-        if not response.parts: # Check if the response even has parts
-            logger_worker.warning(f"{log_prefix}: AI response has no parts. Full response object: {response}")
-            # Check for blocking reasons if prompt_feedback is available
-            if hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
-                block_reason_msg = getattr(response.prompt_feedback, 'block_reason_message', str(response.prompt_feedback.block_reason))
-                logger_worker.error(f"{log_prefix}: AI request was blocked. Reason: {block_reason_msg}")
-            # Consider logging other parts of `response.prompt_feedback` or safety_ratings if available
-            # e.g., logger_worker.debug(f"{log_prefix}: Safety Ratings: {response.prompt_feedback.safety_ratings if hasattr(response.prompt_feedback, 'safety_ratings') else 'N/A'}")
-            return None
+        max_sdk_retries_observed_header = 2
+        for attempt in range(max_sdk_retries_observed_header):
+            try: # Inner try for the API call and parsing, allowing retries
+                logger_worker.info(f"{log_prefix}: Attempting AI header flattening (attempt {attempt + 1}).")
+                # Note: The prompt is logged outside this inner loop, as it doesn't change per attempt.
 
-        generated_json_text = response.text.strip() # response.text should directly give the JSON string if response_mime_type="application/json" worked
+                model = genai.GenerativeModel('gemini-1.5-flash-latest')
+                response = model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig( # Make sure genai.types is available
+                        temperature=0.1,
+                        response_mime_type="application/json"
+                    ),
+                    request_options={'timeout': WORKER_GEMINI_TIMEOUT // 2} 
+                )
+                
+                if not response.parts: 
+                    logger_worker.warning(f"{log_prefix}: AI response (header flattening) has no parts.")
+                    if hasattr(response, 'prompt_feedback') and response.prompt_feedback and response.prompt_feedback.block_reason:
+                        block_reason_msg = getattr(response.prompt_feedback, 'block_reason_message', str(response.prompt_feedback.block_reason))
+                        logger_worker.error(f"{log_prefix}: AI request (header flattening) was blocked. Reason: {block_reason_msg}")
+                    # For a blocked response or no parts, retrying immediately might not help.
+                    # Depending on the block reason, it might be a permanent issue with the prompt or content.
+                    return None # Exit if response is malformed/blocked early
+                
+                generated_json_text = response.text.strip()
+                if generated_json_text.startswith("```json"):
+                    generated_json_text = generated_json_text[len("```json"):].strip()
+                if generated_json_text.endswith("```"):
+                    generated_json_text = generated_json_text[:-len("```")].strip()
+                
+                if not generated_json_text:
+                    logger_worker.warning(f"{log_prefix}: AI (header flattening) returned empty content after stripping markdown.")
+                    return None # Empty content is not useful, probably an issue.
 
-        # Clean potential markdown backticks if the model still adds them
-        if generated_json_text.startswith("```json"):
-           generated_json_text = generated_json_text[len("```json"):].strip()
-        if generated_json_text.endswith("```"):
-           generated_json_text = generated_json_text[:-len("```")].strip()
+                # Inner try for JSON parsing and validation
+                try:
+                    flattened_names = json.loads(generated_json_text)
+                    if not isinstance(flattened_names, list):
+                        logger_worker.error(f"{log_prefix}: AI output (header flattening) was not a JSON list. Got: {type(flattened_names)}")
+                        return None
+                    if len(flattened_names) != num_expected_cols:
+                        logger_worker.error(f"{log_prefix}: AI (header flattening) returned {len(flattened_names)} names, expected {num_expected_cols}. Output: {flattened_names}")
+                        return None
+                    if not all(isinstance(name, str) for name in flattened_names):
+                        logger_worker.error(f"{log_prefix}: AI output list (header flattening) does not contain all strings. Output: {flattened_names}")
+                        return None
+                    
+                    logger_worker.info(f"{log_prefix}: Successfully parsed flattened headers from AI.")
+                    logger_worker.debug(f"{log_prefix}: AI Flattened Names: {flattened_names}")
+                    return flattened_names # SUCCESS - exit the function
 
-        if not generated_json_text:
-            logger_worker.warning(f"{log_prefix}: AI returned empty content after stripping potential markdown.")
-            return None
-
-        try:
-            flattened_names = json.loads(generated_json_text)
-            if not isinstance(flattened_names, list):
-                logger_worker.error(f"{log_prefix}: AI output was not a JSON list. Got: {type(flattened_names)}")
-                return None
-            if len(flattened_names) != num_expected_cols:
-                logger_worker.error(f"{log_prefix}: AI returned {len(flattened_names)} names, expected {num_expected_cols}. Output: {flattened_names}")
-                return None
-            if not all(isinstance(name, str) for name in flattened_names):
-                logger_worker.error(f"{log_prefix}: AI output list does not contain all strings. Output: {flattened_names}")
-                return None
+                except json.JSONDecodeError as e:
+                    logger_worker.error(f"{log_prefix}: Failed to parse JSON from AI (header flattening): {e}. Raw Response Text: {generated_json_text}")
+                    # JSONDecodeError is unlikely to be fixed by a simple retry with the same response.
+                    return None # Exit if JSON is invalid
+                except Exception as e_val: # Catch other validation errors
+                    logger_worker.error(f"{log_prefix}: Error validating AI output structure (header flattening): {e_val}. Output: {generated_json_text}", exc_info=True)
+                    return None # Exit on other validation errors
             
-            logger_worker.info(f"{log_prefix}: Successfully parsed flattened headers from AI.")
-            logger_worker.debug(f"{log_prefix}: AI Flattened Names: {flattened_names}")
-            return flattened_names
-        except json.JSONDecodeError as e:
-            logger_worker.error(f"{log_prefix}: Failed to parse JSON from AI: {e}. Raw Response Text: {generated_json_text}")
-            return None
-        except Exception as e_val: # Catch other validation errors
-            logger_worker.error(f"{log_prefix}: Error validating AI output structure: {e_val}. Output: {generated_json_text}", exc_info=True)
-            return None
-
-    except Exception as e: # Catch errors from AI call itself (e.g., API errors, timeouts)
-        logger_worker.error(f"{log_prefix}: Error during AI header processing call: {e}", exc_info=True)
+            except google.api_core.exceptions.ResourceExhausted as e: # Catch specific SDK exception
+                logger_worker.warning(f"{log_prefix} (AI Header Flattening attempt {attempt + 1}) hit ResourceExhausted (429): {e}")
+                if attempt < max_sdk_retries_observed_header - 1:
+                    delay_match = re.search(r"retry_delay {\s*seconds: (\d+)\s*}", str(e))
+                    # Add +1 to the suggested delay as a small buffer
+                    custom_delay = int(delay_match.group(1)) + 1 if delay_match else 10 * (attempt + 1)
+                    logger_worker.info(f"{log_prefix}: Waiting {custom_delay}s before this function considers retrying AI header flattening.")
+                    time.sleep(custom_delay)
+                    continue # Go to the next attempt in the outer for loop
+                else:
+                    logger_worker.error(f"{log_prefix}: AI header flattening failed after observing SDK retries due to ResourceExhausted.")
+                    return None # Max retries for 429 reached
+            except AttributeError as ae: # Handle cases where genai or its attributes might be mocked improperly
+                 if 'NoneType' in str(ae) and ('default_api_key' in str(ae).lower() or "'MockGenerativeModel' object has no attribute 'types'" in str(ae)):
+                     logger_worker.critical(f"{log_prefix}: Gemini API Key not configured OR SDK mocked and 'types' attribute missing. AI header flattening failed. Error: {ae}")
+                 else:
+                     logger_worker.error(f"{log_prefix}: AttributeError during AI call for header flattening (attempt {attempt+1}): {ae}", exc_info=True)
+                 return None # Likely non-retryable configuration issue
+            except NotImplementedError as nie: # Catch if SDK is mocked and generate_content is called
+                 logger_worker.error(f"{log_prefix}: AI header flattening (attempt {attempt + 1}) called with mocked SDK: {nie}")
+                 return None # SDK is not functional
+            except Exception as e: # Catch other unexpected errors from the SDK call
+                logger_worker.error(f"{log_prefix}: Error during AI header processing call (attempt {attempt + 1}): {e}", exc_info=True)
+                if attempt < max_sdk_retries_observed_header - 1:
+                    time.sleep(5 * (attempt + 1)) # Simple backoff for generic errors
+                    continue # Go to the next attempt
+                else:
+                    logger_worker.error(f"{log_prefix}: AI header flattening failed after all attempts due to general error.")
+                    return None # Max retries for general errors reached
+                
+        # This part is reached if the for loop completes without returning (i.e., all retries failed)
+        logger_worker.error(f"{log_prefix}: AI header flattening failed after all {max_sdk_retries_observed_header} attempts.")
         return None
-# +++ END NEW AI FUNCTION +++
 
-
+    # --- Outer except block for the initial setup part of the function ---
+    except Exception as outer_e:
+        logger_worker.error(f"{log_prefix}: An unexpected error occurred during initial setup for AI header flattening: {outer_e}", exc_info=True)
+        return None
 
 
 
