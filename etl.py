@@ -1671,6 +1671,26 @@ def _process_multi_header_block(
 
 
 # --- Main Processing Logic ---
+
+
+
+# etl.py
+
+# ... (all your existing imports: os, io, json, re, logging, pd, requests, etc.)
+# ... (from worker_config import ...)
+# ... (from ai_data_cleaner import ai_standardize_dates, ai_normalize_text)
+# ... (Worker Logging Setup)
+# ... (Worker Configurations from environment and worker_config)
+# ... (Gemini SDK Initialization)
+# ... (Input Validation for Worker)
+# ... (Worker Clients Initialization: _worker_temp_cred_file_path, _cleanup_worker_temp_file, client variables, try-except block for init)
+# ... (Worker Helper Functions: sanitize_bq_name, get_file_extension, map_pandas_dtype_to_bq)
+# ... (Core Data Reading and Processing Functions: _read_excel_sheets, _score_table_candidate, _find_all_tables_in_sheet, _isolate_data_block, read_data_from_gcs)
+# ... (Header and DataFrame Cleaning Functions: _clean_dataframe_pre_headered, clean_dataframe, _clean_header_cell_text, _header_df_to_csv_string, _get_flattened_headers_via_ai, _process_multi_header_block)
+# ... (Schema and BigQuery Functions: infer_schema_gemini, infer_schema_pandas, get_existing_schema, determine_schema, align_dataframe_to_schema, load_to_bq)
+
+
+# --- Main Processing Logic ---
 def process_object(
     object_name: str,
     target_dataset_id: str,
@@ -1682,30 +1702,22 @@ def process_object(
     apply_ai_smart_cleanup_override: bool = False
 ):
     log_context = f"Obj:{object_name}, Batch:{batch_id}, FileID:{file_id}"
-    # This log line was duplicated, keeping the more informative one below
-    # logger_worker.info(f"--- Starting process_object for {log_context} (Multi-Header: {is_multi_header_file}, Depth: {header_depth_from_user}) ---")
     logger_worker.info(
         f"--- Starting process_object for {log_context} "
         f"(Multi-Header: {is_multi_header_file}, User AI Cleanup Req: {apply_ai_smart_cleanup_override}) ---"
     )
-    processing_successful_internally = True # Assume true, set to false on specific failures
-    final_error_message: Optional[str] = None # Default to no error message
-    overall_processed_table_count = 0 # Moved initialization here
+    processing_successful_internally = True
+    final_error_message: Optional[str] = None
+    overall_processed_table_count = 0
 
-    # This critical log is good for entry tracing
     logger_worker.critical(f"LOCAL_PROCESS_OBJECT_ENTRY_FOR: {object_name} | Thread: {threading.get_ident()}")
-    # This log is slightly redundant with the one above but fine
     logger_worker.info(
         f"--- Starting processing GCS object: {object_name} -> Target BQ Dataset: {target_dataset_id} "
         f"(Multi-Header Mode: {is_multi_header_file}, User Depth: {header_depth_from_user}, AI SDK: {GEMINI_SDK_AVAILABLE}) ---"
     )
-    
-    # all_processing_successful was used for overall status, using processing_successful_internally now
-    # all_processing_successful = True # This can be removed or merged with processing_successful_internally
 
     if not re.match(r"^[a-zA-Z0-9_]+$", target_dataset_id):
          logger_worker.error(f"Invalid target_dataset_id format: '{target_dataset_id}'. Aborting.")
-         # Report failure directly here before raising, as it's a setup issue
          _report_completion_to_api(batch_id, file_id, original_file_name or object_name, False, f"Invalid target_dataset_id: {target_dataset_id}")
          raise ValueError(f"Invalid target dataset ID format: {target_dataset_id}")
 
@@ -1714,14 +1726,10 @@ def process_object(
         raw_data_container = read_data_from_gcs(WORKER_GCS_BUCKET, object_name)
         logger_worker.info(f"PROCESS_OBJECT_AFTER_READ: GCS object: {object_name}, raw_data_container type: {type(raw_data_container)}")
         if raw_data_container is None:
-            # This is a critical failure for this file.
             final_error_message = f"Failed to read data from GCS: {object_name}"
             processing_successful_internally = False
             logger_worker.error(f"PROCESS_OBJECT_ERROR: {final_error_message}")
-            # The finally block will report this. No need to raise ValueError immediately unless it stops all processing.
-            # For now, we let it go to finally. If read_data_from_gcs raises FileNotFoundError, it's caught below.
-            # If it returns None due to other GCS errors, this path is taken.
-            raise ValueError(final_error_message) # Ensure processing stops for this file if read fails
+            raise ValueError(final_error_message)
 
         sheets_to_process_map: Dict[str, pd.DataFrame] = {}
         if isinstance(raw_data_container, pd.DataFrame):
@@ -1731,26 +1739,23 @@ def process_object(
             sheets_to_process_map = raw_data_container
             logger_worker.info(f"Read {len(raw_data_container)} sheets from Excel file.")
         else:
-            # This is a critical internal error.
             final_error_message = f"Unexpected data type from read_data_from_gcs: {type(raw_data_container)}"
             processing_successful_internally = False
             logger_worker.error(final_error_message)
-            raise TypeError(final_error_message) # Stop processing for this file
+            raise TypeError(final_error_message)
 
         base_filename_sanitized = sanitize_bq_name(os.path.splitext(os.path.basename(object_name))[0])
-        # overall_processed_table_count = 0 # Already initialized above
 
         if not sheets_to_process_map:
             logger_worker.warning(f"No sheets/data found in {object_name}. This file will be marked as processed with no tables.")
-            final_error_message = "No data or sheets found in the file." # This is not an error, but a state.
-            processing_successful_internally = True # Processing the "empty" file was successful.
-            # The 'finally' block will handle reporting.
-            return # Exit process_object for this file.
+            final_error_message = "No data or sheets found in the file."
+            processing_successful_internally = True
+            return
 
         logger_worker.info(f"PROCESS_OBJECT_BEFORE_SHEET_LOOP: For {object_name}, sheets to process: {list(sheets_to_process_map.keys()) if sheets_to_process_map else 'None'}")
 
         for sheet_name, original_raw_sheet_df in sheets_to_process_map.items():
-            sheet_log_prefix = f"Obj:{object_name},Sht:{sheet_name}" # Simplified for per-sheet context
+            sheet_log_prefix = f"Obj:{object_name},Sht:{sheet_name}"
             logger_worker.info(f"PROCESS_OBJECT_SHEET_LOOP_ENTRY: For {sheet_log_prefix} (Shape: {original_raw_sheet_df.shape if original_raw_sheet_df is not None else 'None'})")
             if original_raw_sheet_df is None or original_raw_sheet_df.empty:
                 logger_worker.warning(f"Sheet '{sheet_name}' is empty or None. Skipping sheet.")
@@ -1772,16 +1777,15 @@ def process_object(
             for raw_table_block_data in identified_raw_blocks_in_sheet:
                 current_raw_block_df = raw_table_block_data['df']
                 table_suffix_id = raw_table_block_data['id']
-                # Reconstruct log_block_prefix for clarity within this inner loop
                 log_block_prefix = f"Obj:{object_name},Sht:{sheet_name},Blk:{table_suffix_id}"
 
                 logger_worker.info(f"--- Processing {log_block_prefix} (Shape: {current_raw_block_df.shape}) ---")
                 
                 # Step 1: Header Processing (AI or Heuristic) - This populates cleaned_df
                 # =======================================================================
-                cleaned_df: Optional[pd.DataFrame] = None # Initialize to None
+                cleaned_df: Optional[pd.DataFrame] = None 
 
-                attempt_ai_header_processing = ( # Renamed from attempt_ai_processing for clarity
+                attempt_ai_header_processing = (
                     is_multi_header_file and
                     header_depth_from_user is not None and
                     header_depth_from_user > 0 and
@@ -1802,21 +1806,21 @@ def process_object(
                         )
                         if flattened_names:
                             logger_worker.info(f"{log_block_prefix}: AI header processing successful. Applying names.")
-                            if data_material.empty and header_material.empty: # Both parts empty
-                                cleaned_df = pd.DataFrame() # Empty DF, but with schema it might be fine
-                            elif data_material.empty: # All rows were headers per AI
-                                cleaned_df = pd.DataFrame(columns=flattened_names) # Empty DF with AI headers
-                            else: # We have data and AI headers
+                            if data_material.empty and header_material.empty: 
+                                cleaned_df = pd.DataFrame() 
+                            elif data_material.empty: 
+                                cleaned_df = pd.DataFrame(columns=flattened_names)
+                            else: 
                                 if len(flattened_names) == data_material.shape[1]:
                                     data_material.columns = flattened_names
                                     cleaned_df = _clean_dataframe_pre_headered(data_material)
                                 else:
                                     logger_worker.error(f"{log_block_prefix}: AI returned {len(flattened_names)} header names, but data has {data_material.shape[1]} columns. Falling back to simple cleaning.")
-                                    cleaned_df = clean_dataframe(current_raw_block_df.copy()) # Fallback
+                                    cleaned_df = clean_dataframe(current_raw_block_df.copy()) 
                         else:
                             logger_worker.warning(f"{log_block_prefix}: AI header processing failed. Falling back to simple cleaning.")
                             cleaned_df = clean_dataframe(current_raw_block_df.copy())
-                else: # No AI header processing
+                else: 
                     if is_multi_header_file and header_depth_from_user and header_depth_from_user > 0:
                          logger_worker.info(f"{log_block_prefix}: Multi-header specified but AI not used/available. Attempting heuristic multi-header processing.")
                          cleaned_df = _process_multi_header_block(current_raw_block_df.copy(), header_depth_from_user, object_name, sheet_name, table_suffix_id)
@@ -1825,51 +1829,55 @@ def process_object(
                          else:
                              logger_worker.warning(f"{log_block_prefix}: Heuristic multi-header processing failed. Falling back to simple cleaning.")
                              cleaned_df = clean_dataframe(current_raw_block_df.copy())
-                    else: # Standard single-header path
+                    else: 
                         logger_worker.info(f"{log_block_prefix}: Using standard single-header processing (clean_dataframe).")
                         cleaned_df = clean_dataframe(current_raw_block_df.copy())
                 
-                if cleaned_df is None: # Should only happen if _process_multi_header_block returned None and fallback wasn't hit or also failed.
+                if cleaned_df is None: 
                     logger_worker.error(f"{log_block_prefix}: cleaned_df is None after all header processing attempts. Skipping this block.")
-                    processing_successful_internally = False # Mark as an error for this file if a block fails critically
-                    continue # Skip to the next block
-
+                    processing_successful_internally = False 
+                    continue 
+                
+                # << --- MOVED AI SMART VALUE CLEANING LOGIC HERE --- >>
                 # Step 2: AI Smart Value Cleaning (if user enabled AND cleaned_df is ready)
                 # ============================================================================
                 logger_worker.info(f"PROCESS_OBJECT - Check before AI Value Clean block. apply_ai_smart_cleanup_override: {apply_ai_smart_cleanup_override}")
-                if cleaned_df is not None: # Check again, though it should be set or loop continued
+                if cleaned_df is not None:
                     logger_worker.info(f"PROCESS_OBJECT - cleaned_df is NOT None. Shape: {cleaned_df.shape}, Is Empty: {cleaned_df.empty}")
-                else: # Should be caught by the continue above, but defensive
-                    logger_worker.error("PROCESS_OBJECT - Critical: cleaned_df IS None unexpectedly before AI value cleaning attempt. This should not happen.")
-                    processing_successful_internally = False
-                    continue
+                else: # This case should ideally not be reached if the None check above works
+                    logger_worker.error("PROCESS_OBJECT - Critical: cleaned_df IS None unexpectedly before AI value cleaning attempt. This should not happen if header processing logic is sound.")
+                    # If it somehow is None, skip AI value cleaning to prevent errors
+                    processing_successful_internally = False # An unexpected state occurred.
+                    continue # Skip this block
 
 
-                if apply_ai_smart_cleanup_override and not cleaned_df.empty: # No need to check cleaned_df for None here due to check above
+                if apply_ai_smart_cleanup_override and not cleaned_df.empty: 
                     logger_worker.info(f"{log_block_prefix}: Applying AI Smart Cleanup (User Enabled) to data values...")
                     temp_ai_value_cleaned_df = cleaned_df.copy()
                     for col_name_to_clean in temp_ai_value_cleaned_df.columns:
                         original_series = temp_ai_value_cleaned_df[col_name_to_clean]
-                        if original_series.dtype == 'object' or pd.api.types.is_string_dtype(original_series):
+                        # Check if series has string-like data before attempting cleaning
+                        if original_series.dtype == 'object' or pd.api.types.is_string_dtype(original_series.infer_objects()):
                             logger_worker.debug(f"AI Value Clean: Attempting date standardization for col: {col_name_to_clean}")
                             series_after_date_clean = ai_standardize_dates(original_series.copy(), col_name_to_clean)
                             temp_ai_value_cleaned_df[col_name_to_clean] = series_after_date_clean
                             
                             current_col_series_for_text = temp_ai_value_cleaned_df[col_name_to_clean]
-                            if current_col_series_for_text.dtype == 'object' or pd.api.types.is_string_dtype(current_col_series_for_text):
+                            if current_col_series_for_text.dtype == 'object' or pd.api.types.is_string_dtype(current_col_series_for_text.infer_objects()):
                                 logger_worker.debug(f"AI Value Clean: Attempting text normalization for col: {col_name_to_clean}")
                                 series_after_text_norm = ai_normalize_text(current_col_series_for_text.copy(), col_name_to_clean, mode="title_case_trim")
                                 temp_ai_value_cleaned_df[col_name_to_clean] = series_after_text_norm
+                        else:
+                            logger_worker.debug(f"AI Value Clean: Skipping column '{col_name_to_clean}' (dtype: {original_series.dtype}) as it's not object/string like for AI value cleaning.")
                     cleaned_df = temp_ai_value_cleaned_df
                     logger_worker.info(f"{log_block_prefix}: AI Smart Data Value Cleaning completed.")
                 elif not apply_ai_smart_cleanup_override:
                      logger_worker.info(f"{log_block_prefix}: AI Smart Cleanup skipped (User Disabled).")
-                elif apply_ai_smart_cleanup_override and cleaned_df.empty: # If it was not None but became empty
+                elif apply_ai_smart_cleanup_override and cleaned_df.empty: 
                      logger_worker.warning(f"{log_block_prefix}: AI Smart Cleanup requested by user, BUT cleaned_df IS empty after header processing. Skipping AI value cleaning.")
+                # << --- END OF MOVED AI SMART VALUE CLEANING LOGIC --- >>
 
-
-                # Final check on cleaned_df before proceeding to schema and load
-                if cleaned_df.empty: # Note: not checking for None here as it was handled above.
+                if cleaned_df.empty: 
                     logger_worker.warning(f"{log_block_prefix}: DataFrame is empty after header processing and (potentially) AI value cleaning. Skipping this block.")
                     continue
                 
@@ -1881,11 +1889,10 @@ def process_object(
                    len(sheets_to_process_map) > 1 or \
                    (len(identified_raw_blocks_in_sheet) > 1 and sheet_name == "_default_"):
                     final_bq_table_name_parts.append(sanitized_sheet_name_for_bq)
-                if len(identified_raw_blocks_in_sheet) > 1: # Only add table_suffix if multiple tables from ONE sheet
+                if len(identified_raw_blocks_in_sheet) > 1: 
                     final_bq_table_name_parts.append(sanitize_bq_name(table_suffix_id))
                 
                 final_bq_table_name = "_".join(part for part in final_bq_table_name_parts if part)[:1024]
-                # Ensure target_dataset_id from Pub/Sub message is used
                 bq_table_id_full = f"{WORKER_GCP_PROJECT}.{target_dataset_id}.{final_bq_table_name}"
                 logger_worker.info(f"Target BQ table for '{log_block_prefix}': {bq_table_id_full}")
 
@@ -1893,7 +1900,7 @@ def process_object(
                     schema = determine_schema(cleaned_df, bq_table_id_full, WORKER_DEFAULT_SCHEMA_STRATEGY)
                     if schema is None:
                         logger_worker.error(f"Schema determination failed for {bq_table_id_full}. Skipping this table block.")
-                        processing_successful_internally = False # Mark overall as failed for this file
+                        processing_successful_internally = False 
                         continue
                     
                     aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema)
@@ -1909,23 +1916,21 @@ def process_object(
                     overall_processed_table_count += 1
                 except Exception as per_table_error:
                     logger_worker.error(f"--- Error during BQ load phase for table '{final_bq_table_name}' ({bq_table_id_full}): {per_table_error} ---", exc_info=True)
-                    processing_successful_internally = False # Mark overall as failed for this file
+                    processing_successful_internally = False 
             # End loop for tables (blocks) within a sheet
         # End loop for sheets
         
-        # --- Final Summary Logic ---
-        if not processing_successful_internally: # If any per-table error occurred
+        if not processing_successful_internally: 
             if overall_processed_table_count > 0:
                 final_error_message = f"Partially processed; {overall_processed_table_count} tables loaded, but errors occurred on others."
             else:
                 final_error_message = "Failed to process or load any tables successfully due to errors during table processing."
-        elif overall_processed_table_count == 0: # No errors, but no tables loaded
-             if not sheets_to_process_map: # This case is handled earlier by returning
+        elif overall_processed_table_count == 0: 
+             if not sheets_to_process_map: 
                  pass
-             else: # Sheets were present, but no valid tables found/extracted from any sheet
+             else: 
                  final_error_message = "No valid tables were extracted or loaded from the file, though sheets were present."
-        # If processing_successful_internally is True AND overall_processed_table_count > 0, final_error_message remains None (full success)
-
+    
     except FileNotFoundError as fnf_err:
         logger_worker.error(f"GCS object not found: {object_name}. Error: {fnf_err}", exc_info=True)
         final_error_message = f"File not found in GCS: {object_name}"
@@ -1934,28 +1939,25 @@ def process_object(
         logger_worker.critical(f"Critical ImportError in process_object for {log_context}: {imp_err}", exc_info=True)
         final_error_message = f"ETL Worker missing critical dependency: {str(imp_err)}"
         processing_successful_internally = False
-        raise # Re-raise critical infra errors
-    except TypeError as te: # Catching the TypeError from unexpected raw_data_container
+        raise 
+    except TypeError as te: 
         logger_worker.error(f"Internal TypeError in process_object for {log_context}: {te}", exc_info=True)
         final_error_message = f"Internal processing error (type mismatch): {str(te)}"
         processing_successful_internally = False
-    except ValueError as ve: # Catching ValueErrors from invalid dataset_id or failed GCS read
+    except ValueError as ve: 
         logger_worker.error(f"ValueError in process_object for {log_context}: {ve}", exc_info=True)
         final_error_message = f"Processing error (invalid value or setup): {str(ve)}"
         processing_successful_internally = False
-    except Exception as e: # Generic catch-all
+    except Exception as e: 
         logger_worker.error(f"Unhandled Exception in process_object for {log_context}: {e}", exc_info=True)
         final_error_message = f"Unexpected unhandled processing error: {str(e)}"
         processing_successful_internally = False
-        # For truly unexpected errors, re-raising might be appropriate if it means the message should be NACKed and retried.
-        # However, the 'finally' block will report based on processing_successful_internally.
     finally:
         if processing_successful_internally and final_error_message is None and overall_processed_table_count > 0:
              logger_worker.info(f"--- Successfully processed all {overall_processed_table_count} table(s) from GCS: {object_name} -> {target_dataset_id} ---")
-        elif processing_successful_internally and final_error_message is not None: # e.g. no tables found but file processed
+        elif processing_successful_internally and final_error_message is not None: 
              logger_worker.warning(f"--- Finished {object_name} for {target_dataset_id}: {final_error_message} ---")
-        # No specific log here if !processing_successful_internally, as the specific errors would have been logged.
-
+        
         _report_completion_to_api(
             batch_id, 
             file_id, 
@@ -1963,6 +1965,11 @@ def process_object(
             processing_successful_internally, 
             final_error_message
         )
+
+# ... (rest of your etl.py: callback, _report_completion_to_api, __main__ block)
+
+
+
 
 # ... (rest of your etl.py: callback, _report_completion_to_api, __main__ block)
 
