@@ -1765,6 +1765,9 @@ def _process_multi_header_block(
 # ... (Schema and BigQuery Functions: infer_schema_gemini, infer_schema_pandas, get_existing_schema, determine_schema, align_dataframe_to_schema, load_to_bq)
 
 
+
+
+
 # --- Main Processing Logic ---
 def process_object(
     object_name: str,
@@ -1774,37 +1777,35 @@ def process_object(
     batch_id: Optional[str] = None,
     file_id: Optional[str] = None,
     original_file_name: Optional[str] = None,
-    apply_ai_smart_cleanup_override: bool = False
+    apply_ai_smart_cleanup_override: bool = False,
+    text_normalization_mode_override: Optional[str] = None # Default to None
 ):
     log_context = f"Obj:{object_name}, Batch:{batch_id}, FileID:{file_id}"
     logger_worker.info(
         f"--- Starting process_object for {log_context} "
-        f"(Multi-Header: {is_multi_header_file}, User AI Cleanup Req: {apply_ai_smart_cleanup_override}) ---"
+        f"(Multi-Header: {is_multi_header_file}, User AI Cleanup Req: {apply_ai_smart_cleanup_override}, "
+        f"Text Norm Mode: {text_normalization_mode_override}) ---"
     )
     processing_successful_internally = True
     final_error_message: Optional[str] = None
     overall_processed_table_count = 0
 
     logger_worker.critical(f"LOCAL_PROCESS_OBJECT_ENTRY_FOR: {object_name} | Thread: {threading.get_ident()}")
-    logger_worker.info(
-        f"--- Starting processing GCS object: {object_name} -> Target BQ Dataset: {target_dataset_id} "
-        f"(Multi-Header Mode: {is_multi_header_file}, User Depth: {header_depth_from_user}, AI SDK: {GEMINI_SDK_AVAILABLE}) ---"
-    )
 
     if not re.match(r"^[a-zA-Z0-9_]+$", target_dataset_id):
-         logger_worker.error(f"Invalid target_dataset_id format: '{target_dataset_id}'. Aborting.")
-         _report_completion_to_api(batch_id, file_id, original_file_name or object_name, False, f"Invalid target_dataset_id: {target_dataset_id}")
-         raise ValueError(f"Invalid target dataset ID format: {target_dataset_id}")
+        logger_worker.error(f"Invalid target_dataset_id format: '{target_dataset_id}'. Aborting.")
+        raise ValueError(f"Invalid target dataset ID format: {target_dataset_id}")
 
     try:
         logger_worker.critical(f"LOCAL_PROCESS_OBJECT_BEFORE_READ_FOR: {object_name} | Thread: {threading.get_ident()}")
         raw_data_container = read_data_from_gcs(WORKER_GCS_BUCKET, object_name)
         logger_worker.info(f"PROCESS_OBJECT_AFTER_READ: GCS object: {object_name}, raw_data_container type: {type(raw_data_container)}")
+
         if raw_data_container is None:
             final_error_message = f"Failed to read data from GCS: {object_name}"
             processing_successful_internally = False
             logger_worker.error(f"PROCESS_OBJECT_ERROR: {final_error_message}")
-            raise ValueError(final_error_message)
+            return
 
         sheets_to_process_map: Dict[str, pd.DataFrame] = {}
         if isinstance(raw_data_container, pd.DataFrame):
@@ -1817,7 +1818,7 @@ def process_object(
             final_error_message = f"Unexpected data type from read_data_from_gcs: {type(raw_data_container)}"
             processing_successful_internally = False
             logger_worker.error(final_error_message)
-            raise TypeError(final_error_message)
+            return
 
         base_filename_sanitized = sanitize_bq_name(os.path.splitext(os.path.basename(object_name))[0])
 
@@ -1856,10 +1857,9 @@ def process_object(
 
                 logger_worker.info(f"--- Processing {log_block_prefix} (Shape: {current_raw_block_df.shape}) ---")
                 
-                # Step 1: Header Processing (AI or Heuristic) - This populates cleaned_df
-                # =======================================================================
                 cleaned_df: Optional[pd.DataFrame] = None 
 
+                # --- Step 1: Header Processing ---
                 attempt_ai_header_processing = (
                     is_multi_header_file and
                     header_depth_from_user is not None and
@@ -1897,13 +1897,13 @@ def process_object(
                             cleaned_df = clean_dataframe(current_raw_block_df.copy())
                 else: 
                     if is_multi_header_file and header_depth_from_user and header_depth_from_user > 0:
-                         logger_worker.info(f"{log_block_prefix}: Multi-header specified but AI not used/available. Attempting heuristic multi-header processing.")
-                         cleaned_df = _process_multi_header_block(current_raw_block_df.copy(), header_depth_from_user, object_name, sheet_name, table_suffix_id)
-                         if cleaned_df is not None:
-                             cleaned_df = _clean_dataframe_pre_headered(cleaned_df)
-                         else:
-                             logger_worker.warning(f"{log_block_prefix}: Heuristic multi-header processing failed. Falling back to simple cleaning.")
-                             cleaned_df = clean_dataframe(current_raw_block_df.copy())
+                        logger_worker.info(f"{log_block_prefix}: Multi-header specified but AI not used/available. Attempting heuristic multi-header processing.")
+                        temp_cleaned_df_heuristic = _process_multi_header_block(current_raw_block_df.copy(), header_depth_from_user, object_name, sheet_name, table_suffix_id)
+                        if temp_cleaned_df_heuristic is not None:
+                            cleaned_df = _clean_dataframe_pre_headered(temp_cleaned_df_heuristic)
+                        else:
+                            logger_worker.warning(f"{log_block_prefix}: Heuristic multi-header processing failed or returned None. Falling back to simple cleaning.")
+                            cleaned_df = clean_dataframe(current_raw_block_df.copy())
                     else: 
                         logger_worker.info(f"{log_block_prefix}: Using standard single-header processing (clean_dataframe).")
                         cleaned_df = clean_dataframe(current_raw_block_df.copy())
@@ -1911,53 +1911,88 @@ def process_object(
                 if cleaned_df is None: 
                     logger_worker.error(f"{log_block_prefix}: cleaned_df is None after all header processing attempts. Skipping this block.")
                     processing_successful_internally = False 
+                    final_error_message = final_error_message or f"Header processing failed for block {table_suffix_id}."
                     continue 
                 
-                # << --- MOVED AI SMART VALUE CLEANING LOGIC HERE --- >>
-                # Step 2: AI Smart Value Cleaning (if user enabled AND cleaned_df is ready)
-                # ============================================================================
+                # --- Step 2: Advanced AI Smart Value Cleaning & Type Identification ---
                 logger_worker.info(f"PROCESS_OBJECT - Check before AI Value Clean block. apply_ai_smart_cleanup_override: {apply_ai_smart_cleanup_override}")
-                if cleaned_df is not None:
-                    logger_worker.info(f"PROCESS_OBJECT - cleaned_df is NOT None. Shape: {cleaned_df.shape}, Is Empty: {cleaned_df.empty}")
-                else: # This case should ideally not be reached if the None check above works
-                    logger_worker.error("PROCESS_OBJECT - Critical: cleaned_df IS None unexpectedly before AI value cleaning attempt. This should not happen if header processing logic is sound.")
-                    # If it somehow is None, skip AI value cleaning to prevent errors
-                    processing_successful_internally = False # An unexpected state occurred.
-                    continue # Skip this block
-
-
+                
                 if apply_ai_smart_cleanup_override and not cleaned_df.empty: 
-                    logger_worker.info(f"{log_block_prefix}: Applying AI Smart Cleanup (User Enabled) to data values...")
+                    logger_worker.info(f"{log_block_prefix}: Applying ADVANCED AI Smart Cleanup (User Enabled). Mode: {text_normalization_mode_override}")
                     temp_ai_value_cleaned_df = cleaned_df.copy()
+                    
                     for col_name_to_clean in temp_ai_value_cleaned_df.columns:
                         original_series = temp_ai_value_cleaned_df[col_name_to_clean]
-                        # Check if series has string-like data before attempting cleaning
-                        if original_series.dtype == 'object' or pd.api.types.is_string_dtype(original_series.infer_objects()):
-                            logger_worker.debug(f"AI Value Clean: Attempting date standardization for col: {col_name_to_clean}")
+                        series_log_prefix = f"{log_block_prefix}, Col:'{col_name_to_clean}'"
+
+                        # Only process if column is object/string type initially
+                        if not (original_series.dtype == 'object' or pd.api.types.is_string_dtype(original_series.infer_objects())):
+                            logger_worker.debug(f"{series_log_prefix} - Skipping AI value cleaning (not object/string type, actual: {original_series.dtype}).")
+                            continue
+
+                        # --- Stage 1: Date Standardization (if applicable) ---
+                        is_likely_date_col = False
+                        if not original_series.empty:
+                            # Heuristic: Sample and check for date-like patterns.
+                            # This heuristic is crucial to avoid misinterpreting numeric/ID columns as dates.
+                            # Enhanced Heuristic:
+                            # 1. Try direct pandas datetime conversion on a sample.
+                            # 2. If that fails, check regex patterns.
+                            # 3. Consider ratio of date-like vs numeric-like vs other.
+                            sample_size = min(100, len(original_series.dropna())) # Increased sample size
+                            if sample_size > 0:
+                                sample_data = original_series.dropna().sample(sample_size, random_state=1).astype(str)
+                                
+                                # Attempt direct pandas conversion on sample (more robust than regex alone for simple dates)
+                                try:
+                                    converted_sample = pd.to_datetime(sample_data, errors='coerce')
+                                    # If a significant portion (>60%) converted successfully AND
+                                    # there aren't too many original values that look purely numeric
+                                    successful_conversions = converted_sample.notna().sum()
+                                    purely_numeric_in_sample = sample_data.str.match(r'^-?\d+(\.\d+)?$').sum()
+
+                                    if successful_conversions / sample_size > 0.6 and \
+                                       (purely_numeric_in_sample / sample_size) < 0.3: # Less than 30% look like plain numbers
+                                        is_likely_date_col = True
+                                        logger_worker.debug(f"{series_log_prefix} - Heuristic: LIKELY DATE (pandas to_datetime on sample: {successful_conversions}/{sample_size} success, numerics: {purely_numeric_in_sample}).")
+                                    else:
+                                        logger_worker.debug(f"{series_log_prefix} - Heuristic: UNLIKELY DATE (pandas to_datetime on sample: {successful_conversions}/{sample_size} success, numerics: {purely_numeric_in_sample}).")
+                                except Exception:
+                                    logger_worker.debug(f"{series_log_prefix} - Heuristic: pandas to_datetime on sample failed, relying on other checks.")
+                                    pass # Fallback to regex or other checks if direct conversion fails
+
+                        if is_likely_date_col:
+                            logger_worker.debug(f"{series_log_prefix} - Applying AI date standardization.")
                             series_after_date_clean = ai_standardize_dates(original_series.copy(), col_name_to_clean)
                             temp_ai_value_cleaned_df[col_name_to_clean] = series_after_date_clean
-                            
-                            current_col_series_for_text = temp_ai_value_cleaned_df[col_name_to_clean]
-                            if current_col_series_for_text.dtype == 'object' or pd.api.types.is_string_dtype(current_col_series_for_text.infer_objects()):
-                                logger_worker.debug(f"AI Value Clean: Attempting text normalization for col: {col_name_to_clean}")
-                                series_after_text_norm = ai_normalize_text(current_col_series_for_text.copy(), col_name_to_clean, mode="title_case_trim")
-                                temp_ai_value_cleaned_df[col_name_to_clean] = series_after_text_norm
                         else:
-                            logger_worker.debug(f"AI Value Clean: Skipping column '{col_name_to_clean}' (dtype: {original_series.dtype}) as it's not object/string like for AI value cleaning.")
+                            logger_worker.debug(f"{series_log_prefix} - SKIPPING AI date standardization based on heuristics.")
+
+                        # --- Stage 2: Text Normalization (always run on current state of string-like columns) ---
+                        current_col_series_for_text = temp_ai_value_cleaned_df[col_name_to_clean] # Get (potentially date-standardized) series
+                        if current_col_series_for_text.dtype == 'object' or pd.api.types.is_string_dtype(current_col_series_for_text.infer_objects()):
+                            logger_worker.debug(f"{series_log_prefix} - Applying AI text normalization (mode: {text_normalization_mode_override}).")
+                            series_after_text_norm = ai_normalize_text(
+                                current_col_series_for_text.copy(),
+                                col_name_to_clean,
+                                mode=text_normalization_mode_override
+                            )
+                            temp_ai_value_cleaned_df[col_name_to_clean] = series_after_text_norm
+                    
                     cleaned_df = temp_ai_value_cleaned_df
-                    logger_worker.info(f"{log_block_prefix}: AI Smart Data Value Cleaning completed.")
+                    logger_worker.info(f"{log_block_prefix}: ADVANCED AI Smart Data Value Cleaning completed.")
                 elif not apply_ai_smart_cleanup_override:
-                     logger_worker.info(f"{log_block_prefix}: AI Smart Cleanup skipped (User Disabled).")
+                    logger_worker.info(f"{log_block_prefix}: AI Smart Cleanup skipped (User Disabled).")
                 elif apply_ai_smart_cleanup_override and cleaned_df.empty: 
-                     logger_worker.warning(f"{log_block_prefix}: AI Smart Cleanup requested by user, BUT cleaned_df IS empty after header processing. Skipping AI value cleaning.")
-                # << --- END OF MOVED AI SMART VALUE CLEANING LOGIC --- >>
+                    logger_worker.warning(f"{log_block_prefix}: AI Smart Cleanup requested by user, BUT cleaned_df IS empty after header processing. Skipping AI value cleaning.")
+
 
                 if cleaned_df.empty: 
                     logger_worker.warning(f"{log_block_prefix}: DataFrame is empty after header processing and (potentially) AI value cleaning. Skipping this block.")
                     continue
                 
-                # Step 3: BQ Table Naming, Schema Determination, Alignment, and Load
-                # ==================================================================
+                # --- Step 3: BQ Table Naming, Schema Determination, Alignment, and Load ---
+                # (This part remains largely the same as your existing logic)
                 sanitized_sheet_name_for_bq = sanitize_bq_name(sheet_name)
                 final_bq_table_name_parts = [base_filename_sanitized]
                 if sheet_name != "_default_" or \
@@ -1972,13 +2007,15 @@ def process_object(
                 logger_worker.info(f"Target BQ table for '{log_block_prefix}': {bq_table_id_full}")
 
                 try:
+                    # Schema determination now acts on the more precisely cleaned 'cleaned_df'
                     schema = determine_schema(cleaned_df, bq_table_id_full, WORKER_DEFAULT_SCHEMA_STRATEGY)
                     if schema is None:
                         logger_worker.error(f"Schema determination failed for {bq_table_id_full}. Skipping this table block.")
                         processing_successful_internally = False 
-                        continue
+                        final_error_message = final_error_message or f"Schema determination failed for {final_bq_table_name}"
+                        continue 
                     
-                    aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema)
+                    aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema) # Align this refined df
                     
                     if aligned_df.empty and not cleaned_df.empty:
                         logger_worker.warning(f"DataFrame for {bq_table_id_full} became empty after schema alignment. Original cleaned shape: {cleaned_df.shape}. Skipping load.")
@@ -1991,26 +2028,29 @@ def process_object(
                     overall_processed_table_count += 1
                 except Exception as per_table_error:
                     logger_worker.error(f"--- Error during BQ load phase for table '{final_bq_table_name}' ({bq_table_id_full}): {per_table_error} ---", exc_info=True)
-                    processing_successful_internally = False 
+                    processing_successful_internally = False
+                    final_error_message = final_error_message or f"Load to BQ failed for {final_bq_table_name}: {str(per_table_error)[:100]}"
             # End loop for tables (blocks) within a sheet
         # End loop for sheets
         
         if not processing_successful_internally: 
             if overall_processed_table_count > 0:
-                final_error_message = f"Partially processed; {overall_processed_table_count} tables loaded, but errors occurred on others."
+                final_error_message = f"Partially processed; {overall_processed_table_count} table(s) loaded, but errors occurred. First error: {final_error_message or 'See logs.'}"
             else:
-                final_error_message = "Failed to process or load any tables successfully due to errors during table processing."
-        elif overall_processed_table_count == 0: 
-             if not sheets_to_process_map: 
-                 pass
-             else: 
-                 final_error_message = "No valid tables were extracted or loaded from the file, though sheets were present."
-    
+                final_error_message = f"Failed to process or load any tables. First error: {final_error_message or 'See logs.'}"
+        elif overall_processed_table_count == 0 and sheets_to_process_map : 
+            if not final_error_message:
+                 final_error_message = "No valid tables were extracted or loaded from the file, though file/sheets were present."
+
+    except ValueError as ve: 
+        logger_worker.error(f"ValueError in process_object setup for {log_context}: {ve}", exc_info=False) 
+        final_error_message = str(ve)
+        processing_successful_internally = False
     except FileNotFoundError as fnf_err:
         logger_worker.error(f"GCS object not found: {object_name}. Error: {fnf_err}", exc_info=True)
         final_error_message = f"File not found in GCS: {object_name}"
         processing_successful_internally = False
-    except ImportError as imp_err:
+    except ImportError as imp_err: 
         logger_worker.critical(f"Critical ImportError in process_object for {log_context}: {imp_err}", exc_info=True)
         final_error_message = f"ETL Worker missing critical dependency: {str(imp_err)}"
         processing_successful_internally = False
@@ -2018,10 +2058,6 @@ def process_object(
     except TypeError as te: 
         logger_worker.error(f"Internal TypeError in process_object for {log_context}: {te}", exc_info=True)
         final_error_message = f"Internal processing error (type mismatch): {str(te)}"
-        processing_successful_internally = False
-    except ValueError as ve: 
-        logger_worker.error(f"ValueError in process_object for {log_context}: {ve}", exc_info=True)
-        final_error_message = f"Processing error (invalid value or setup): {str(ve)}"
         processing_successful_internally = False
     except Exception as e: 
         logger_worker.error(f"Unhandled Exception in process_object for {log_context}: {e}", exc_info=True)
@@ -2031,18 +2067,17 @@ def process_object(
         if processing_successful_internally and final_error_message is None and overall_processed_table_count > 0:
              logger_worker.info(f"--- Successfully processed all {overall_processed_table_count} table(s) from GCS: {object_name} -> {target_dataset_id} ---")
         elif processing_successful_internally and final_error_message is not None: 
-             logger_worker.warning(f"--- Finished {object_name} for {target_dataset_id}: {final_error_message} ---")
+             logger_worker.warning(f"--- Finished {object_name} for {target_dataset_id} with message: {final_error_message} ---")
+        elif not processing_successful_internally: 
+            logger_worker.error(f"--- Finished processing {object_name} for {target_dataset_id} WITH ERRORS. Final status: {final_error_message or 'Details in logs.'} ---")
         
         _report_completion_to_api(
             batch_id, 
             file_id, 
-            original_file_name or object_name,
+            original_file_name or object_name, 
             processing_successful_internally, 
-            final_error_message
+            final_error_message 
         )
-
-# ... (rest of your etl.py: callback, _report_completion_to_api, __main__ block)
-
 
 
 
@@ -2063,113 +2098,157 @@ def process_object(
 
 # ... (existing imports) ...
 
-def callback(message: Any): # Add type hint for message if possible (e.g., from google.cloud.pubsub_v1.subscriber.message import Message)
+
+
+def callback(message: Any): # Consider 'from google.cloud.pubsub_v1.subscriber.message import Message' for Message type hint
+    # --- Variable Initialization ---
     object_name: Optional[str] = None
     target_dataset_id: Optional[str] = None
-    # +++ NEW: Initialize multi-header params +++
-    is_multi_header: Optional[bool] = False
+    is_multi_header: bool = False # Default to False for safety
     header_depth: Optional[int] = None
     batch_id_from_msg: Optional[str] = None
     file_id_from_msg: Optional[str] = None
     original_file_name_from_msg: Optional[str] = None
-    apply_ai_smart_cleanup_from_msg: bool = False
-    # +++ END NEW +++
+    apply_ai_smart_cleanup_from_msg: bool = False # Default to False
+    text_normalization_mode_from_msg: Optional[str] = None # Default to None
 
     raw_message_data = message.data
-    object_name_for_log = "PRE_DECODE_UNKNOWN" # Keep this for initial logging
-    temp_object_name_for_log = "UNKNOWN_OBJECT_IN_CALLBACK" 
+    # For logging before actual values are known, or if decoding fails
+    pre_decode_object_name_for_log = "PRE_DECODE_UNKNOWN_OBJECT"
+    current_object_name_for_log = "UNKNOWN_OBJECT_IN_CALLBACK"
 
     try:
         message_str = raw_message_data.decode("utf-8")
         message_data = json.loads(message_str)
-        
+
+        # --- Extract Core Fields ---
         object_name = message_data.get("object_name")
         target_dataset_id = message_data.get("target_dataset_id")
-        # +++ NEW: Extract multi-header params from message +++
+        batch_id_from_msg = message_data.get("batch_id")
+        file_id_from_msg = message_data.get("file_id")
+        original_file_name_from_msg = message_data.get("original_file_name")
+
+        # Update log variable now that object_name might be available
+        current_object_name_for_log = object_name or "OBJECT_NAME_MISSING_IN_JSON"
+
+        # --- Extract Feature-Specific Fields ---
         is_multi_header = message_data.get("is_multi_header", False) # Default to False if not present
-        apply_ai_smart_cleanup_from_msg = message_data.get("apply_ai_smart_cleanup", False)
+
         header_depth_raw = message_data.get("header_depth")
         if header_depth_raw is not None:
             try:
                 header_depth = int(header_depth_raw)
-                if not (1 <= header_depth <= 10): # Match Pydantic validation
-                    logger_worker.warning(f"Received invalid header_depth {header_depth_raw} for {object_name}. Ignoring.")
+                if not (1 <= header_depth <= 10): # Consistent with Pydantic validation
+                    logger_worker.warning(
+                        f"CALLBACK: Received invalid header_depth {header_depth_raw} for {current_object_name_for_log}. "
+                        f"Setting to None and treating as single header."
+                    )
                     header_depth = None
-                    is_multi_header = False # Treat as single if depth is invalid
+                    # is_multi_header = False # If depth is invalid, multi-header mode doesn't make sense
             except ValueError:
-                logger_worker.warning(f"Received non-integer header_depth '{header_depth_raw}' for {object_name}. Ignoring.")
+                logger_worker.warning(
+                    f"CALLBACK: Received non-integer header_depth '{header_depth_raw}' for {current_object_name_for_log}. "
+                    f"Setting to None and treating as single header."
+                )
                 header_depth = None
-                is_multi_header = False # Treat as single if depth is invalid
-        # +++ END NEW +++
-                # ...
+                # is_multi_header = False
+
         apply_ai_smart_cleanup_from_msg = message_data.get("apply_ai_smart_cleanup", False)
-        logger_worker.info(f"CALLBACK - Extracted apply_ai_smart_cleanup: {apply_ai_smart_cleanup_from_msg}") # THIS IS A NEW LOG
-        # ...
-        object_name_for_log = object_name or "OBJECT_NAME_MISSING_IN_JSON"
-        temp_object_name_for_log = object_name_for_log
 
-        logger_worker.critical(f"LOCAL_CALLBACK_RECEIVED_MESSAGE_FOR: {object_name_for_log} | Thread: {threading.get_ident()}")
-        logger_worker.info(
-            f"CALLBACK_ENTRY: Processing Pub/Sub message for object: {temp_object_name_for_log}, "
-            f"Target Dataset: {target_dataset_id}, Multi-Header: {is_multi_header}, Depth: {header_depth}"
-        )
-        batch_id_from_msg = message_data.get("batch_id")
-        file_id_from_msg = message_data.get("file_id")
-        original_file_name_from_msg = message_data.get("original_file_name") # Ensure this key matches what main.py sends
-        if not all([object_name, target_dataset_id, batch_id_from_msg, file_id_from_msg, original_file_name_from_msg]):
-             logger_worker.error(f"CALLBACK_ERROR: Missing critical fields in message. Nacking. Data: {message_data}")
-             message.nack()
-             return
-        if is_multi_header and header_depth is None: # (re-check header_depth parsing here)
-             header_depth_raw = message_data.get("header_depth")
-             if header_depth_raw is not None:
-                 try:
-                     header_depth = int(header_depth_raw)
-                     if not (1 <= header_depth <= 10): header_depth = None
-                 except ValueError: header_depth = None
-             if header_depth is None:
-                logger_worker.error(f"CALLBACK_ERROR: Multi-header TRUE but invalid/missing header_depth for {object_name}. Nacking.")
-                _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, "Invalid header_depth for multi-header mode.")
-                message.ack() # ACK because the message itself is bad, no point retrying. Worker reported error.
-                return
-        if not object_name or not target_dataset_id:
-            logger_worker.error(f"CALLBACK_ERROR: Invalid Pub/Sub message format for {temp_object_name_for_log}: Missing 'object_name' or 'target_dataset_id'. Data: {message_str}")
-            message.nack()
-            return
-        
-        # +++ NEW: Validate header_depth consistency with is_multi_header +++
-        if is_multi_header and header_depth is None:
-            logger_worker.error(f"CALLBACK_ERROR: Inconsistent message for {temp_object_name_for_log}: is_multi_header is True but header_depth is missing or invalid. Nacking.")
-            message.nack()
-            return
-        # +++ END NEW +++
-
-        # Pass new params to process_object
-        process_object(
-            object_name, target_dataset_id, 
-            is_multi_header, header_depth,
-            batch_id_from_msg, file_id_from_msg, original_file_name_from_msg,apply_ai_smart_cleanup_override=apply_ai_smart_cleanup_from_msg
-        )
-        
-        message.ack()
-        logger_worker.info(f"CALLBACK_SUCCESS: ACKed and initiated processing for Batch:{batch_id_from_msg}, FileID:{file_id_from_msg}")
-    except Exception as e: # Catch errors from json.loads or initial setup in callback
-        logger_worker.exception(f"Outer CALLBACK_CRITICAL_ERROR for object {object_name or 'Unknown'} (Batch: {batch_id_from_msg}, File: {file_id_from_msg}): {e}")
-        # Try to report this callback-level failure if we have IDs
-        if batch_id_from_msg and file_id_from_msg and original_file_name_from_msg:
-            _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, f"Callback error: {str(e)}")
-            message.ack() # ACK because we reported it, prevent retry loops for malformed messages
+        if apply_ai_smart_cleanup_from_msg:
+            text_normalization_mode_from_msg = message_data.get("text_normalization_mode") # Can be None if not sent
+            if not text_normalization_mode_from_msg:
+                logger_worker.info( # Changed to info, as worker can default
+                    f"CALLBACK: AI cleanup enabled for {current_object_name_for_log} "
+                    f"but text_normalization_mode not specified by API. Worker will use its default."
+                )
         else:
-            message.nack() # NACK if we don't have enough info to report
+            # Explicitly ensure mode is None if AI cleanup is off
+            text_normalization_mode_from_msg = None
 
-    # ... (existing except blocks) ...
+        # --- Logging Received Data ---
+        logger_worker.critical(
+            f"LOCAL_CALLBACK_RECEIVED_MESSAGE_FOR: {current_object_name_for_log} | Thread: {threading.get_ident()}"
+        )
+        logger_worker.info(
+            f"CALLBACK_ENTRY: Processing Pub/Sub message for object: {current_object_name_for_log}, "
+            f"Target Dataset: {target_dataset_id}, BatchID: {batch_id_from_msg}, FileID: {file_id_from_msg}, "
+            f"OrigName: {original_file_name_from_msg}, Multi-Header: {is_multi_header}, Depth: {header_depth}, "
+            f"AI Cleanup: {apply_ai_smart_cleanup_from_msg}, Text Norm Mode: {text_normalization_mode_from_msg}"
+        )
+
+        # --- Input Validation ---
+        if not all([object_name, target_dataset_id, batch_id_from_msg, file_id_from_msg, original_file_name_from_msg]):
+            error_detail = f"Missing one or more critical fields in Pub/Sub message. Data: {message_data}"
+            logger_worker.error(f"CALLBACK_ERROR: {error_detail}")
+            # For fundamentally malformed messages that worker cannot process, ACK after reporting
+            # to prevent endless retries if we can report it.
+            # If we can't report (e.g., missing batch/file IDs), then NACK.
+            _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, error_detail)
+            message.ack()
+            return
+
+        if is_multi_header and header_depth is None:
+            error_detail = f"Multi-header mode enabled but header_depth is missing or invalid for {current_object_name_for_log}."
+            logger_worker.error(f"CALLBACK_ERROR: {error_detail}")
+            _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, error_detail)
+            message.ack() # ACK as this is a message content issue, not transient worker issue
+            return
+
+        # --- Call Main Processing Logic ---
+        process_object(
+            object_name=object_name,
+            target_dataset_id=target_dataset_id,
+            is_multi_header_file=is_multi_header,
+            header_depth_from_user=header_depth,
+            batch_id=batch_id_from_msg,
+            file_id=file_id_from_msg,
+            original_file_name=original_file_name_from_msg,
+            apply_ai_smart_cleanup_override=apply_ai_smart_cleanup_from_msg,
+            text_normalization_mode_override=text_normalization_mode_from_msg # Pass the extracted mode
+        )
+
+        message.ack()
+        logger_worker.info(
+            f"CALLBACK_SUCCESS: Successfully ACKed and initiated processing for "
+            f"Batch:{batch_id_from_msg}, FileID:{file_id_from_msg}, Object: {current_object_name_for_log}"
+        )
+
     except json.JSONDecodeError as json_err:
-        logger_worker.error(f"CALLBACK_JSON_ERROR: For initial log name '{object_name_for_log}'. Failed to parse Pub/Sub message JSON: {json_err}. Raw Data: '{raw_message_data.decode('utf-8', errors='replace')}'")
-        message.nack()
+        # This error means the message itself is malformed (not valid JSON)
+        raw_data_preview = raw_message_data.decode('utf-8', errors='replace')[:200] # Log preview
+        logger_worker.error(
+            f"CALLBACK_JSON_ERROR: For Pub/Sub message (initial log name '{pre_decode_object_name_for_log}'). "
+            f"Failed to parse message JSON: {json_err}. Raw Data Preview: '{raw_data_preview}'"
+        )
+        message.nack() # NACK, as this message cannot be processed by this worker
+                       # If this persists, check publisher format.
+
     except Exception as e:
-        logger_worker.exception(f"CALLBACK_CRITICAL_ERROR: For {temp_object_name_for_log}. Error: {e}")
-        message.nack()
-        logger_worker.info(f"CALLBACK_NACK: NACKed message for: {temp_object_name_for_log} due to critical error.")
+        # Catch-all for any other unexpected errors within the callback logic itself
+        # (e.g., issues before process_object is called, or if process_object raises unexpectedly here)
+        logger_worker.exception(
+             f"CALLBACK_CRITICAL_UNHANDLED_ERROR: For object '{current_object_name_for_log}' "
+             f"(Batch: {batch_id_from_msg}, File: {file_id_from_msg}). Error: {e}"
+        )
+        # Try to report this critical callback-level failure if we have IDs
+        if batch_id_from_msg and file_id_from_msg and original_file_name_from_msg:
+            _report_completion_to_api(
+                batch_id_from_msg,
+                file_id_from_msg,
+                original_file_name_from_msg,
+                False,
+                f"Critical worker callback error: {str(e)}"
+            )
+            message.ack() # ACK because we've reported it. Prevents retry loops for unrecoverable callback errors.
+        else:
+            # If we don't have enough info to report, NACK to allow Pub/Sub to retry or dead-letter.
+            message.nack()
+        logger_worker.info(
+            f"CALLBACK_FINAL_STATE: For {current_object_name_for_log}. Message {'ACKed after reporting error' if batch_id_from_msg else 'NACKed'}. "
+        )
+
+
 
 def _report_completion_to_api(
     batch_id: str, 
