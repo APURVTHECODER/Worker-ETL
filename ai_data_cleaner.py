@@ -253,6 +253,25 @@ def ai_normalize_text(column_series: pd.Series, column_name: str, mode: Optional
         normalization_instruction = "1. Trim leading/trailing whitespace. 2. Ensure single spaces between internal words. Preserve original casing."
         example_input_str = json.dumps(["  John   Doe  ", "  leading", "trailing  ", "  ALL CAPS  ", "Mixed   Case Example"])
         example_output_str = json.dumps(["John Doe", "leading", "trailing", "ALL CAPS", "Mixed Case Example"])
+    elif mode == "trim_preserve_internal_sep":
+        normalization_instruction = (
+            "1. Trim leading/trailing whitespace ONLY. "
+            "2. Preserve ALL internal characters, including underscores (_), hyphens (-), etc., exactly as they are. "
+            "3. Preserve original casing exactly as it is. "
+            "4. If multiple internal spaces exist between words, consolidate them to a single space, but do not replace other separators like underscores with spaces."
+        )
+        example_input_str = json.dumps([
+            "  Product_1  ", 
+            "  product_NAME_two  ", 
+            "  Alpha-Beta Company  ", 
+            "  Keep   Multiple  Spaces  "
+        ])
+        example_output_str = json.dumps([
+            "Product_1", # Underscore preserved, casing preserved
+            "product_NAME_two", # Underscore and casing preserved
+            "Alpha-Beta Company", # Hyphen and casing preserved
+            "Keep Multiple Spaces" # Internal multiple spaces consolidated
+        ])
     # Example for a new mode (you'd add this to frontend options too)
     # elif mode == "remove_special_chars_alpha_num_space_trim":
     #     normalization_instruction = "1. Trim leading/trailing whitespace. 2. Remove all characters except letters (any case), numbers, and single spaces between words. 3. Convert multiple internal spaces to a single space."

@@ -1778,22 +1778,30 @@ def process_object(
     file_id: Optional[str] = None,
     original_file_name: Optional[str] = None,
     apply_ai_smart_cleanup_override: bool = False,
-    text_normalization_mode_override: Optional[str] = None # Default to None
+    text_normalization_mode_override: Optional[str] = None,
+    # +++ UNPIVOT PARAMETERS +++
+    enable_unpivot_override: bool = False,
+    unpivot_id_cols_list_override: Optional[List[str]] = None,
+    unpivot_var_name_override: Optional[str] = "Attribute",
+    unpivot_value_name_override: Optional[str] = "Value"
 ):
     log_context = f"Obj:{object_name}, Batch:{batch_id}, FileID:{file_id}"
+    start_time_process_object = time.monotonic() # +++ TIME TRACKING START +++
     logger_worker.info(
         f"--- Starting process_object for {log_context} "
-        f"(Multi-Header: {is_multi_header_file}, User AI Cleanup Req: {apply_ai_smart_cleanup_override}, "
-        f"Text Norm Mode: {text_normalization_mode_override}) ---"
+        f"(MultiHeader: {is_multi_header_file}, UserDepth: {header_depth_from_user}, "
+        f"AICleanup: {apply_ai_smart_cleanup_override}, TextMode: {text_normalization_mode_override}, "
+        f"Unpivot: {enable_unpivot_override}, UnpivotIDs: {unpivot_id_cols_list_override}, "
+        f"UnpivotVar: {unpivot_var_name_override}, UnpivotVal: {unpivot_value_name_override}) ---"
     )
     processing_successful_internally = True
     final_error_message: Optional[str] = None
     overall_processed_table_count = 0
-
+    total_rows_loaded_for_this_file = 0 # +++ INITIALIZE 
     logger_worker.critical(f"LOCAL_PROCESS_OBJECT_ENTRY_FOR: {object_name} | Thread: {threading.get_ident()}")
 
     if not re.match(r"^[a-zA-Z0-9_]+$", target_dataset_id):
-        logger_worker.error(f"Invalid target_dataset_id format: '{target_dataset_id}'. Aborting.")
+        # Error will be caught by the main try-except and reported in finally
         raise ValueError(f"Invalid target dataset ID format: {target_dataset_id}")
 
     try:
@@ -1803,32 +1811,22 @@ def process_object(
 
         if raw_data_container is None:
             final_error_message = f"Failed to read data from GCS: {object_name}"
-            processing_successful_internally = False
-            logger_worker.error(f"PROCESS_OBJECT_ERROR: {final_error_message}")
-            return
+            processing_successful_internally = False; return
+            
 
         sheets_to_process_map: Dict[str, pd.DataFrame] = {}
         if isinstance(raw_data_container, pd.DataFrame):
             sheets_to_process_map["_default_"] = raw_data_container
-            logger_worker.info("Read single DataFrame (CSV/Parquet). Processing as default sheet.")
-        elif isinstance(raw_data_container, dict):
-            sheets_to_process_map = raw_data_container
-            logger_worker.info(f"Read {len(raw_data_container)} sheets from Excel file.")
+        elif isinstance(raw_data_container, dict): sheets_to_process_map = raw_data_container
         else:
             final_error_message = f"Unexpected data type from read_data_from_gcs: {type(raw_data_container)}"
-            processing_successful_internally = False
-            logger_worker.error(final_error_message)
-            return
+            processing_successful_internally = False; return
 
         base_filename_sanitized = sanitize_bq_name(os.path.splitext(os.path.basename(object_name))[0])
 
         if not sheets_to_process_map:
-            logger_worker.warning(f"No sheets/data found in {object_name}. This file will be marked as processed with no tables.")
             final_error_message = "No data or sheets found in the file."
-            processing_successful_internally = True
-            return
-
-        logger_worker.info(f"PROCESS_OBJECT_BEFORE_SHEET_LOOP: For {object_name}, sheets to process: {list(sheets_to_process_map.keys()) if sheets_to_process_map else 'None'}")
+            processing_successful_internally = True; return # Considered "processed" but empty
 
         for sheet_name, original_raw_sheet_df in sheets_to_process_map.items():
             sheet_log_prefix = f"Obj:{object_name},Sht:{sheet_name}"
@@ -1838,15 +1836,12 @@ def process_object(
                 continue
 
             identified_raw_blocks_in_sheet = _find_all_tables_in_sheet(
-                original_raw_sheet_df,
-                min_rows=WORKER_MIN_TABLE_ROWS,
-                min_cols=WORKER_MIN_TABLE_COLS,
-                block_density_threshold=WORKER_BLOCK_DENSITY_THRESHOLD,
-                header_confidence=WORKER_MIN_HEADER_CONFIDENCE
+                original_raw_sheet_df, min_rows=WORKER_MIN_TABLE_ROWS, min_cols=WORKER_MIN_TABLE_COLS,
+                block_density_threshold=WORKER_BLOCK_DENSITY_THRESHOLD, header_confidence=WORKER_MIN_HEADER_CONFIDENCE
             )
 
             if not identified_raw_blocks_in_sheet:
-                logger_worker.info(f"No distinct tables found in sheet '{sheet_name}' using block detection.")
+                logger_worker.info(f"No distinct tables found in sheet '{sheet_name}'.")
                 continue
             logger_worker.info(f"Found {len(identified_raw_blocks_in_sheet)} distinct raw table block(s) in sheet '{sheet_name}'.")
 
@@ -1854,128 +1849,140 @@ def process_object(
                 current_raw_block_df = raw_table_block_data['df']
                 table_suffix_id = raw_table_block_data['id']
                 log_block_prefix = f"Obj:{object_name},Sht:{sheet_name},Blk:{table_suffix_id}"
-
                 logger_worker.info(f"--- Processing {log_block_prefix} (Shape: {current_raw_block_df.shape}) ---")
                 
-                cleaned_df: Optional[pd.DataFrame] = None 
-
+                df_after_header_processing: Optional[pd.DataFrame] = None
+                
                 # --- Step 1: Header Processing ---
-                attempt_ai_header_processing = (
-                    is_multi_header_file and
-                    header_depth_from_user is not None and
-                    header_depth_from_user > 0 and
-                    GEMINI_SDK_AVAILABLE and WORKER_GEMINI_API_KEY
-                )
-
+                attempt_ai_header_processing = (is_multi_header_file and header_depth_from_user and header_depth_from_user > 0 and GEMINI_SDK_AVAILABLE and WORKER_GEMINI_API_KEY)
                 if attempt_ai_header_processing:
-                    logger_worker.info(f"{log_block_prefix}: Attempting AI multi-header processing (depth={header_depth_from_user}).")
                     actual_header_depth = min(header_depth_from_user, current_raw_block_df.shape[0])
                     if actual_header_depth < 1:
-                        logger_worker.warning(f"{log_block_prefix}: Effective header depth < 1 for AI. Falling back to simple cleaning.")
-                        cleaned_df = clean_dataframe(current_raw_block_df.copy())
+                        df_after_header_processing = clean_dataframe(current_raw_block_df.copy())
                     else:
                         header_material = current_raw_block_df.iloc[:actual_header_depth, :].copy()
                         data_material = current_raw_block_df.iloc[actual_header_depth:, :].copy().reset_index(drop=True)
-                        flattened_names = _get_flattened_headers_via_ai(
-                            header_material, actual_header_depth, header_material.shape[1], log_block_prefix
-                        )
+                        flattened_names = _get_flattened_headers_via_ai(header_material, actual_header_depth, header_material.shape[1], log_block_prefix)
                         if flattened_names:
-                            logger_worker.info(f"{log_block_prefix}: AI header processing successful. Applying names.")
-                            if data_material.empty and header_material.empty: 
-                                cleaned_df = pd.DataFrame() 
-                            elif data_material.empty: 
-                                cleaned_df = pd.DataFrame(columns=flattened_names)
-                            else: 
-                                if len(flattened_names) == data_material.shape[1]:
-                                    data_material.columns = flattened_names
-                                    cleaned_df = _clean_dataframe_pre_headered(data_material)
-                                else:
-                                    logger_worker.error(f"{log_block_prefix}: AI returned {len(flattened_names)} header names, but data has {data_material.shape[1]} columns. Falling back to simple cleaning.")
-                                    cleaned_df = clean_dataframe(current_raw_block_df.copy()) 
-                        else:
-                            logger_worker.warning(f"{log_block_prefix}: AI header processing failed. Falling back to simple cleaning.")
-                            cleaned_df = clean_dataframe(current_raw_block_df.copy())
-                else: 
-                    if is_multi_header_file and header_depth_from_user and header_depth_from_user > 0:
-                        logger_worker.info(f"{log_block_prefix}: Multi-header specified but AI not used/available. Attempting heuristic multi-header processing.")
-                        temp_cleaned_df_heuristic = _process_multi_header_block(current_raw_block_df.copy(), header_depth_from_user, object_name, sheet_name, table_suffix_id)
-                        if temp_cleaned_df_heuristic is not None:
-                            cleaned_df = _clean_dataframe_pre_headered(temp_cleaned_df_heuristic)
-                        else:
-                            logger_worker.warning(f"{log_block_prefix}: Heuristic multi-header processing failed or returned None. Falling back to simple cleaning.")
-                            cleaned_df = clean_dataframe(current_raw_block_df.copy())
-                    else: 
-                        logger_worker.info(f"{log_block_prefix}: Using standard single-header processing (clean_dataframe).")
-                        cleaned_df = clean_dataframe(current_raw_block_df.copy())
+                            if data_material.empty and not header_material.empty : df_after_header_processing = pd.DataFrame(columns=flattened_names)
+                            elif not data_material.empty and len(flattened_names) == data_material.shape[1]:
+                                data_material.columns = flattened_names
+                                df_after_header_processing = _clean_dataframe_pre_headered(data_material)
+                            elif data_material.empty and header_material.empty: df_after_header_processing = pd.DataFrame()
+                            else: df_after_header_processing = clean_dataframe(current_raw_block_df.copy())
+                        else: df_after_header_processing = clean_dataframe(current_raw_block_df.copy())
+                elif is_multi_header_file and header_depth_from_user and header_depth_from_user > 0:
+                    temp_df_heuristic = _process_multi_header_block(current_raw_block_df.copy(), header_depth_from_user, object_name, sheet_name, table_suffix_id)
+                    if temp_df_heuristic is not None: df_after_header_processing = _clean_dataframe_pre_headered(temp_df_heuristic)
+                    else: df_after_header_processing = clean_dataframe(current_raw_block_df.copy())
+                else:
+                    df_after_header_processing = clean_dataframe(current_raw_block_df.copy())
                 
-                if cleaned_df is None: 
-                    logger_worker.error(f"{log_block_prefix}: cleaned_df is None after all header processing attempts. Skipping this block.")
-                    processing_successful_internally = False 
-                    final_error_message = final_error_message or f"Header processing failed for block {table_suffix_id}."
-                    continue 
+                if df_after_header_processing is None: 
+                    logger_worker.error(f"{log_block_prefix}: DataFrame is None after header processing. Skipping block.")
+                    processing_successful_internally = False; final_error_message = final_error_message or f"Header processing failed for block {table_suffix_id}."; continue
+                if df_after_header_processing.empty:
+                    logger_worker.warning(f"{log_block_prefix}: DataFrame is empty after header processing. Skipping further steps for this block.")
+                    continue
+
+                # --- Step 1.5: Unpivot Data ---
+                df_after_unpivot: pd.DataFrame = df_after_header_processing 
+                if enable_unpivot_override and unpivot_id_cols_list_override:
+                    logger_worker.info(f"{log_block_prefix}: Applying Unpivot. ID Cols: {unpivot_id_cols_list_override}, Var: '{unpivot_var_name_override}', Value: '{unpivot_value_name_override}'.")
+                    valid_id_vars = [col for col in unpivot_id_cols_list_override if col in df_after_header_processing.columns]
+                    if not valid_id_vars:
+                        logger_worker.warning(f"{log_block_prefix}: Unpivot ID columns {unpivot_id_cols_list_override} not found or empty in DataFrame headers {list(df_after_header_processing.columns)}. Skipping unpivot for this block.")
+                    elif len(valid_id_vars) < len(unpivot_id_cols_list_override):
+                        logger_worker.warning(f"{log_block_prefix}: Some Unpivot ID columns not found. Using valid ones: {valid_id_vars}")
+                    
+                    if valid_id_vars:
+                        value_vars = [col for col in df_after_header_processing.columns if col not in valid_id_vars]
+                        if not value_vars:
+                            logger_worker.warning(f"{log_block_prefix}: No columns left to unpivot after selecting ID vars. Skipping unpivot for this block.")
+                        else:
+                            try:
+                                df_after_unpivot = pd.melt(
+                                    df_after_header_processing, id_vars=valid_id_vars, value_vars=value_vars,
+                                    var_name=unpivot_var_name_override, value_name=unpivot_value_name_override
+                                )
+                                logger_worker.info(f"{log_block_prefix}: Unpivot successful. New shape: {df_after_unpivot.shape}")
+                            except Exception as e_melt:
+                                logger_worker.error(f"{log_block_prefix}: Error during pandas.melt (unpivot): {e_melt}", exc_info=True)
+                                final_error_message = final_error_message or f"Unpivot operation failed for block {table_suffix_id}."; processing_successful_internally = False
+                                # df_after_unpivot remains df_after_header_processing if melt fails
+
+                if df_after_unpivot.empty and not df_after_header_processing.empty :
+                     logger_worker.warning(f"{log_block_prefix}: DataFrame became empty after unpivot. Original shape before unpivot: {df_after_header_processing.shape}.")
                 
                 # --- Step 2: Advanced AI Smart Value Cleaning & Type Identification ---
-                logger_worker.info(f"PROCESS_OBJECT - Check before AI Value Clean block. apply_ai_smart_cleanup_override: {apply_ai_smart_cleanup_override}")
+                cleaned_df: pd.DataFrame = df_after_unpivot # Initialize with (potentially) unpivoted data
                 
                 if apply_ai_smart_cleanup_override and not cleaned_df.empty: 
-                    logger_worker.info(f"{log_block_prefix}: Applying ADVANCED AI Smart Cleanup (User Enabled). Mode: {text_normalization_mode_override}")
+                    logger_worker.info(f"{log_block_prefix}: Applying ADVANCED AI Smart Cleanup. Mode: {text_normalization_mode_override}")
                     temp_ai_value_cleaned_df = cleaned_df.copy()
                     
                     for col_name_to_clean in temp_ai_value_cleaned_df.columns:
                         original_series = temp_ai_value_cleaned_df[col_name_to_clean]
                         series_log_prefix = f"{log_block_prefix}, Col:'{col_name_to_clean}'"
 
-                        # Only process if column is object/string type initially
                         if not (original_series.dtype == 'object' or pd.api.types.is_string_dtype(original_series.infer_objects())):
                             logger_worker.debug(f"{series_log_prefix} - Skipping AI value cleaning (not object/string type, actual: {original_series.dtype}).")
                             continue
 
-                        # --- Stage 1: Date Standardization (if applicable) ---
-                        is_likely_date_col = False
-                        if not original_series.empty:
-                            # Heuristic: Sample and check for date-like patterns.
-                            # This heuristic is crucial to avoid misinterpreting numeric/ID columns as dates.
-                            # Enhanced Heuristic:
-                            # 1. Try direct pandas datetime conversion on a sample.
-                            # 2. If that fails, check regex patterns.
-                            # 3. Consider ratio of date-like vs numeric-like vs other.
-                            sample_size = min(100, len(original_series.dropna())) # Increased sample size
+                        # --- Advanced Heuristic for Date Column Identification ---
+                        is_actually_date_column = False
+                        if not original_series.dropna().empty: # Check if there are any non-NA values
+                            sample_size = min(100, len(original_series.dropna()))
                             if sample_size > 0:
-                                sample_data = original_series.dropna().sample(sample_size, random_state=1).astype(str)
-                                
-                                # Attempt direct pandas conversion on sample (more robust than regex alone for simple dates)
+                                sample_data = original_series.dropna().sample(sample_size, random_state=42).astype(str) # Use random_state
+                                date_like_count = 0
+                                numeric_like_count = 0
+                                # Try direct pandas datetime conversion on a sample first
                                 try:
                                     converted_sample = pd.to_datetime(sample_data, errors='coerce')
-                                    # If a significant portion (>60%) converted successfully AND
-                                    # there aren't too many original values that look purely numeric
                                     successful_conversions = converted_sample.notna().sum()
-                                    purely_numeric_in_sample = sample_data.str.match(r'^-?\d+(\.\d+)?$').sum()
+                                    # Check if original sample values that converted were not purely numeric looking
+                                    # This helps distinguish '2023' (year) from '2023' (a number)
+                                    non_numeric_originals_converted = 0
+                                    for i, val_str in enumerate(sample_data):
+                                        if converted_sample.iloc[i] is not pd.NaT and not re.fullmatch(r'-?\d+(\.\d+)?', val_str):
+                                            non_numeric_originals_converted +=1
 
-                                    if successful_conversions / sample_size > 0.6 and \
-                                       (purely_numeric_in_sample / sample_size) < 0.3: # Less than 30% look like plain numbers
-                                        is_likely_date_col = True
-                                        logger_worker.debug(f"{series_log_prefix} - Heuristic: LIKELY DATE (pandas to_datetime on sample: {successful_conversions}/{sample_size} success, numerics: {purely_numeric_in_sample}).")
-                                    else:
-                                        logger_worker.debug(f"{series_log_prefix} - Heuristic: UNLIKELY DATE (pandas to_datetime on sample: {successful_conversions}/{sample_size} success, numerics: {purely_numeric_in_sample}).")
-                                except Exception:
-                                    logger_worker.debug(f"{series_log_prefix} - Heuristic: pandas to_datetime on sample failed, relying on other checks.")
-                                    pass # Fallback to regex or other checks if direct conversion fails
+                                    # More stringent: high conversion rate AND most converted were not simple numbers
+                                    if successful_conversions / sample_size > 0.7 and non_numeric_originals_converted / max(1, successful_conversions) > 0.5:
+                                        is_actually_date_column = True
+                                        logger_worker.debug(f"{series_log_prefix} - Heuristic: LIKELY DATE (Pandas to_datetime success: {successful_conversions}/{sample_size}, non-numeric converted: {non_numeric_originals_converted}).")
+                                    else: # Fallback to regex if pandas conversion wasn't decisive
+                                        for val_str in sample_data:
+                                            if not val_str: continue
+                                            if re.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$', val_str) or \
+                                               re.match(r'^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?$', val_str) or \
+                                               re.match(r'^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s*\d{1,2}\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s*\d{4}', val_str, re.IGNORECASE) or \
+                                               re.match(r'^\d{1,2}\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s*,?\s*\d{2,4}', val_str, re.IGNORECASE):
+                                                date_like_count += 1
+                                            elif re.fullmatch(r'-?\d+(\.\d+)?', val_str): # Use fullmatch for pure numbers
+                                                numeric_like_count += 1
+                                        if date_like_count / sample_size > 0.6 and date_like_count > numeric_like_count:
+                                            is_actually_date_column = True
+                                            logger_worker.debug(f"{series_log_prefix} - Heuristic: LIKELY DATE (Regex counts - Dates: {date_like_count}, Numerics: {numeric_like_count} of {sample_size}).")
+                                        else:
+                                            logger_worker.debug(f"{series_log_prefix} - Heuristic: UNLIKELY DATE (Regex counts - Dates: {date_like_count}, Numerics: {numeric_like_count} of {sample_size}).")
+                                except Exception as e_heuristic:
+                                     logger_worker.warning(f"{series_log_prefix} - Exception during date heuristic: {e_heuristic}")
 
-                        if is_likely_date_col:
+
+                        if is_actually_date_column:
                             logger_worker.debug(f"{series_log_prefix} - Applying AI date standardization.")
                             series_after_date_clean = ai_standardize_dates(original_series.copy(), col_name_to_clean)
                             temp_ai_value_cleaned_df[col_name_to_clean] = series_after_date_clean
                         else:
-                            logger_worker.debug(f"{series_log_prefix} - SKIPPING AI date standardization based on heuristics.")
-
-                        # --- Stage 2: Text Normalization (always run on current state of string-like columns) ---
-                        current_col_series_for_text = temp_ai_value_cleaned_df[col_name_to_clean] # Get (potentially date-standardized) series
+                            logger_worker.debug(f"{series_log_prefix} - SKIPPING AI date standardization based on advanced heuristics.")
+                        
+                        current_col_series_for_text = temp_ai_value_cleaned_df[col_name_to_clean]
                         if current_col_series_for_text.dtype == 'object' or pd.api.types.is_string_dtype(current_col_series_for_text.infer_objects()):
                             logger_worker.debug(f"{series_log_prefix} - Applying AI text normalization (mode: {text_normalization_mode_override}).")
                             series_after_text_norm = ai_normalize_text(
-                                current_col_series_for_text.copy(),
-                                col_name_to_clean,
-                                mode=text_normalization_mode_override
+                                current_col_series_for_text.copy(), col_name_to_clean, mode=text_normalization_mode_override
                             )
                             temp_ai_value_cleaned_df[col_name_to_clean] = series_after_text_norm
                     
@@ -1983,20 +1990,19 @@ def process_object(
                     logger_worker.info(f"{log_block_prefix}: ADVANCED AI Smart Data Value Cleaning completed.")
                 elif not apply_ai_smart_cleanup_override:
                     logger_worker.info(f"{log_block_prefix}: AI Smart Cleanup skipped (User Disabled).")
+                    cleaned_df = df_after_unpivot # Ensure cleaned_df takes the (un)pivoted data
                 elif apply_ai_smart_cleanup_override and cleaned_df.empty: 
-                    logger_worker.warning(f"{log_block_prefix}: AI Smart Cleanup requested by user, BUT cleaned_df IS empty after header processing. Skipping AI value cleaning.")
-
+                    logger_worker.warning(f"{log_block_prefix}: AI Smart Cleanup requested, but DataFrame is empty. Skipping value cleaning.")
+                    # cleaned_df is already empty from df_after_unpivot
 
                 if cleaned_df.empty: 
-                    logger_worker.warning(f"{log_block_prefix}: DataFrame is empty after header processing and (potentially) AI value cleaning. Skipping this block.")
+                    logger_worker.warning(f"{log_block_prefix}: DataFrame is empty after all processing steps. Skipping BQ load for this block.")
                     continue
                 
-                # --- Step 3: BQ Table Naming, Schema Determination, Alignment, and Load ---
-                # (This part remains largely the same as your existing logic)
+                # --- Step 3: BQ Table Naming, Schema, Align, Load ---
                 sanitized_sheet_name_for_bq = sanitize_bq_name(sheet_name)
                 final_bq_table_name_parts = [base_filename_sanitized]
-                if sheet_name != "_default_" or \
-                   len(sheets_to_process_map) > 1 or \
+                if sheet_name != "_default_" or len(sheets_to_process_map) > 1 or \
                    (len(identified_raw_blocks_in_sheet) > 1 and sheet_name == "_default_"):
                     final_bq_table_name_parts.append(sanitized_sheet_name_for_bq)
                 if len(identified_raw_blocks_in_sheet) > 1: 
@@ -2007,25 +2013,22 @@ def process_object(
                 logger_worker.info(f"Target BQ table for '{log_block_prefix}': {bq_table_id_full}")
 
                 try:
-                    # Schema determination now acts on the more precisely cleaned 'cleaned_df'
                     schema = determine_schema(cleaned_df, bq_table_id_full, WORKER_DEFAULT_SCHEMA_STRATEGY)
-                    if schema is None:
-                        logger_worker.error(f"Schema determination failed for {bq_table_id_full}. Skipping this table block.")
+                    if schema is None or not schema: # Added 'not schema' for empty list case
+                        logger_worker.error(f"Schema determination failed or returned empty for {bq_table_id_full}. Skipping this table block.")
                         processing_successful_internally = False 
                         final_error_message = final_error_message or f"Schema determination failed for {final_bq_table_name}"
                         continue 
                     
-                    aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema) # Align this refined df
+                    aligned_df = align_dataframe_to_schema(cleaned_df.copy(), schema)
                     
-                    if aligned_df.empty and not cleaned_df.empty:
-                        logger_worker.warning(f"DataFrame for {bq_table_id_full} became empty after schema alignment. Original cleaned shape: {cleaned_df.shape}. Skipping load.")
-                        continue
-                    elif aligned_df.empty and cleaned_df.empty:
-                        logger_worker.info(f"DataFrame for {bq_table_id_full} was already empty before alignment. Skipping load.")
-                        continue
+                    if aligned_df.empty: # Check if it became empty OR was already empty
+                         logger_worker.warning(f"DataFrame for {bq_table_id_full} is empty after schema alignment (or was already empty). Original cleaned shape: {cleaned_df.shape}. Skipping load.")
+                         continue
                     
                     load_to_bq(aligned_df, bq_table_id_full, schema, WORKER_DEFAULT_WRITE_DISPOSITION)
                     overall_processed_table_count += 1
+                    total_rows_loaded_for_this_file += len(aligned_df)
                 except Exception as per_table_error:
                     logger_worker.error(f"--- Error during BQ load phase for table '{final_bq_table_name}' ({bq_table_id_full}): {per_table_error} ---", exc_info=True)
                     processing_successful_internally = False
@@ -2039,7 +2042,7 @@ def process_object(
             else:
                 final_error_message = f"Failed to process or load any tables. First error: {final_error_message or 'See logs.'}"
         elif overall_processed_table_count == 0 and sheets_to_process_map : 
-            if not final_error_message:
+            if not final_error_message: # Only set if no other error message is already present
                  final_error_message = "No valid tables were extracted or loaded from the file, though file/sheets were present."
 
     except ValueError as ve: 
@@ -2064,6 +2067,7 @@ def process_object(
         final_error_message = f"Unexpected unhandled processing error: {str(e)}"
         processing_successful_internally = False
     finally:
+        processing_duration_ms = int((time.monotonic() - start_time_process_object) * 1000) # +++ CALCULATE DURATION 
         if processing_successful_internally and final_error_message is None and overall_processed_table_count > 0:
              logger_worker.info(f"--- Successfully processed all {overall_processed_table_count} table(s) from GCS: {object_name} -> {target_dataset_id} ---")
         elif processing_successful_internally and final_error_message is not None: 
@@ -2076,10 +2080,11 @@ def process_object(
             file_id, 
             original_file_name or object_name, 
             processing_successful_internally, 
-            final_error_message 
+            final_error_message ,
+            tables_created_count=overall_processed_table_count,
+            total_rows_loaded=total_rows_loaded_for_this_file,
+            processing_duration_ms=processing_duration_ms
         )
-
-
 
 # ... (rest of your etl.py: callback, _report_completion_to_api, __main__ block)
 
@@ -2104,16 +2109,20 @@ def callback(message: Any): # Consider 'from google.cloud.pubsub_v1.subscriber.m
     # --- Variable Initialization ---
     object_name: Optional[str] = None
     target_dataset_id: Optional[str] = None
-    is_multi_header: bool = False # Default to False for safety
+    is_multi_header: bool = False
     header_depth: Optional[int] = None
     batch_id_from_msg: Optional[str] = None
     file_id_from_msg: Optional[str] = None
     original_file_name_from_msg: Optional[str] = None
-    apply_ai_smart_cleanup_from_msg: bool = False # Default to False
-    text_normalization_mode_from_msg: Optional[str] = None # Default to None
+    apply_ai_smart_cleanup_from_msg: bool = False
+    text_normalization_mode_from_msg: Optional[str] = None
+    # +++ Initialize unpivot params +++
+    enable_unpivot_from_msg: bool = False
+    unpivot_id_cols_list_from_msg: Optional[List[str]] = None
+    unpivot_var_name_from_msg: str = "Attribute" # Default, will be overridden if present in message
+    unpivot_value_name_from_msg: str = "Value"   # Default, will be overridden if present in message
 
     raw_message_data = message.data
-    # For logging before actual values are known, or if decoding fails
     pre_decode_object_name_for_log = "PRE_DECODE_UNKNOWN_OBJECT"
     current_object_name_for_log = "UNKNOWN_OBJECT_IN_CALLBACK"
 
@@ -2128,62 +2137,67 @@ def callback(message: Any): # Consider 'from google.cloud.pubsub_v1.subscriber.m
         file_id_from_msg = message_data.get("file_id")
         original_file_name_from_msg = message_data.get("original_file_name")
 
-        # Update log variable now that object_name might be available
         current_object_name_for_log = object_name or "OBJECT_NAME_MISSING_IN_JSON"
 
         # --- Extract Feature-Specific Fields ---
-        is_multi_header = message_data.get("is_multi_header", False) # Default to False if not present
+        is_multi_header = message_data.get("is_multi_header", False)
 
         header_depth_raw = message_data.get("header_depth")
         if header_depth_raw is not None:
             try:
                 header_depth = int(header_depth_raw)
-                if not (1 <= header_depth <= 10): # Consistent with Pydantic validation
+                if not (1 <= header_depth <= 10):
                     logger_worker.warning(
                         f"CALLBACK: Received invalid header_depth {header_depth_raw} for {current_object_name_for_log}. "
-                        f"Setting to None and treating as single header."
+                        f"Setting to None." # No longer setting is_multi_header = False here, validation later
                     )
                     header_depth = None
-                    # is_multi_header = False # If depth is invalid, multi-header mode doesn't make sense
             except ValueError:
                 logger_worker.warning(
                     f"CALLBACK: Received non-integer header_depth '{header_depth_raw}' for {current_object_name_for_log}. "
-                    f"Setting to None and treating as single header."
+                    f"Setting to None."
                 )
                 header_depth = None
-                # is_multi_header = False
 
         apply_ai_smart_cleanup_from_msg = message_data.get("apply_ai_smart_cleanup", False)
 
         if apply_ai_smart_cleanup_from_msg:
-            text_normalization_mode_from_msg = message_data.get("text_normalization_mode") # Can be None if not sent
+            text_normalization_mode_from_msg = message_data.get("text_normalization_mode")
             if not text_normalization_mode_from_msg:
-                logger_worker.info( # Changed to info, as worker can default
+                logger_worker.info(
                     f"CALLBACK: AI cleanup enabled for {current_object_name_for_log} "
                     f"but text_normalization_mode not specified by API. Worker will use its default."
                 )
         else:
-            # Explicitly ensure mode is None if AI cleanup is off
             text_normalization_mode_from_msg = None
 
-        # --- Logging Received Data ---
+        # +++ Extract unpivot params from message +++
+        enable_unpivot_from_msg = message_data.get("enable_unpivot", False)
+        if enable_unpivot_from_msg:
+            # These names match ETLRequestPubSubPayload in main.py
+            unpivot_id_cols_list_from_msg = message_data.get("unpivot_id_cols_list")
+            # Use defaults from initialization if specific keys are missing in message
+            unpivot_var_name_from_msg = message_data.get("unpivot_var_name", unpivot_var_name_from_msg)
+            unpivot_value_name_from_msg = message_data.get("unpivot_value_name", unpivot_value_name_from_msg)
+        # If enable_unpivot_from_msg is False, the initialized defaults or None for list will be used.
+
+        # --- Logging Received Data (Comprehensive) ---
         logger_worker.critical(
             f"LOCAL_CALLBACK_RECEIVED_MESSAGE_FOR: {current_object_name_for_log} | Thread: {threading.get_ident()}"
         )
         logger_worker.info(
             f"CALLBACK_ENTRY: Processing Pub/Sub message for object: {current_object_name_for_log}, "
-            f"Target Dataset: {target_dataset_id}, BatchID: {batch_id_from_msg}, FileID: {file_id_from_msg}, "
-            f"OrigName: {original_file_name_from_msg}, Multi-Header: {is_multi_header}, Depth: {header_depth}, "
-            f"AI Cleanup: {apply_ai_smart_cleanup_from_msg}, Text Norm Mode: {text_normalization_mode_from_msg}"
+            f"TargetDs: {target_dataset_id}, BatchID: {batch_id_from_msg}, FileID: {file_id_from_msg}, "
+            f"OrigName: {original_file_name_from_msg}, MultiHeader: {is_multi_header}, Depth: {header_depth}, "
+            f"AICleanup: {apply_ai_smart_cleanup_from_msg}, TextMode: {text_normalization_mode_from_msg}, "
+            f"Unpivot: {enable_unpivot_from_msg}, UnpivotIDs: {unpivot_id_cols_list_from_msg}, "
+            f"UnpivotVar: {unpivot_var_name_from_msg}, UnpivotVal: {unpivot_value_name_from_msg}"
         )
 
         # --- Input Validation ---
         if not all([object_name, target_dataset_id, batch_id_from_msg, file_id_from_msg, original_file_name_from_msg]):
             error_detail = f"Missing one or more critical fields in Pub/Sub message. Data: {message_data}"
             logger_worker.error(f"CALLBACK_ERROR: {error_detail}")
-            # For fundamentally malformed messages that worker cannot process, ACK after reporting
-            # to prevent endless retries if we can report it.
-            # If we can't report (e.g., missing batch/file IDs), then NACK.
             _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, error_detail)
             message.ack()
             return
@@ -2192,8 +2206,35 @@ def callback(message: Any): # Consider 'from google.cloud.pubsub_v1.subscriber.m
             error_detail = f"Multi-header mode enabled but header_depth is missing or invalid for {current_object_name_for_log}."
             logger_worker.error(f"CALLBACK_ERROR: {error_detail}")
             _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, error_detail)
-            message.ack() # ACK as this is a message content issue, not transient worker issue
+            message.ack()
             return
+
+        if enable_unpivot_from_msg:
+            if not unpivot_id_cols_list_from_msg or not isinstance(unpivot_id_cols_list_from_msg, list):
+                error_detail = (f"Unpivot enabled for {current_object_name_for_log} but 'unpivot_id_cols_list' "
+                                f"is missing or not a list. Received: {type(unpivot_id_cols_list_from_msg)}")
+                logger_worker.error(f"CALLBACK_ERROR: {error_detail}")
+                _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, error_detail)
+                message.ack()
+                return
+            if not all(isinstance(c, str) and c.strip() for c in unpivot_id_cols_list_from_msg):
+                error_detail = (f"Unpivot enabled for {current_object_name_for_log} but 'unpivot_id_cols_list' "
+                                f"contains non-string or empty string items: {unpivot_id_cols_list_from_msg}")
+                logger_worker.error(f"CALLBACK_ERROR: {error_detail}")
+                _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, error_detail)
+                message.ack()
+                return
+            if not unpivot_var_name_from_msg or not unpivot_var_name_from_msg.strip():
+                 error_detail = f"Unpivot enabled for {current_object_name_for_log} but 'unpivot_var_name' is empty."
+                 logger_worker.error(f"CALLBACK_ERROR: {error_detail}")
+                 _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, error_detail)
+                 message.ack(); return
+            if not unpivot_value_name_from_msg or not unpivot_value_name_from_msg.strip():
+                 error_detail = f"Unpivot enabled for {current_object_name_for_log} but 'unpivot_value_name' is empty."
+                 logger_worker.error(f"CALLBACK_ERROR: {error_detail}")
+                 _report_completion_to_api(batch_id_from_msg, file_id_from_msg, original_file_name_from_msg, False, error_detail)
+                 message.ack(); return
+
 
         # --- Call Main Processing Logic ---
         process_object(
@@ -2205,7 +2246,12 @@ def callback(message: Any): # Consider 'from google.cloud.pubsub_v1.subscriber.m
             file_id=file_id_from_msg,
             original_file_name=original_file_name_from_msg,
             apply_ai_smart_cleanup_override=apply_ai_smart_cleanup_from_msg,
-            text_normalization_mode_override=text_normalization_mode_from_msg # Pass the extracted mode
+            text_normalization_mode_override=text_normalization_mode_from_msg,
+            # Pass unpivot parameters
+            enable_unpivot_override=enable_unpivot_from_msg,
+            unpivot_id_cols_list_override=unpivot_id_cols_list_from_msg,
+            unpivot_var_name_override=unpivot_var_name_from_msg,
+            unpivot_value_name_override=unpivot_value_name_from_msg
         )
 
         message.ack()
@@ -2215,73 +2261,100 @@ def callback(message: Any): # Consider 'from google.cloud.pubsub_v1.subscriber.m
         )
 
     except json.JSONDecodeError as json_err:
-        # This error means the message itself is malformed (not valid JSON)
-        raw_data_preview = raw_message_data.decode('utf-8', errors='replace')[:200] # Log preview
+        raw_data_preview = raw_message_data.decode('utf-8', errors='replace')[:200]
         logger_worker.error(
             f"CALLBACK_JSON_ERROR: For Pub/Sub message (initial log name '{pre_decode_object_name_for_log}'). "
             f"Failed to parse message JSON: {json_err}. Raw Data Preview: '{raw_data_preview}'"
         )
-        message.nack() # NACK, as this message cannot be processed by this worker
-                       # If this persists, check publisher format.
+        message.nack()
 
     except Exception as e:
-        # Catch-all for any other unexpected errors within the callback logic itself
-        # (e.g., issues before process_object is called, or if process_object raises unexpectedly here)
         logger_worker.exception(
              f"CALLBACK_CRITICAL_UNHANDLED_ERROR: For object '{current_object_name_for_log}' "
              f"(Batch: {batch_id_from_msg}, File: {file_id_from_msg}). Error: {e}"
         )
-        # Try to report this critical callback-level failure if we have IDs
         if batch_id_from_msg and file_id_from_msg and original_file_name_from_msg:
             _report_completion_to_api(
                 batch_id_from_msg,
                 file_id_from_msg,
                 original_file_name_from_msg,
                 False,
-                f"Critical worker callback error: {str(e)}"
+                f"Critical worker callback error: {str(e)[:200]}" # Truncate error message
             )
-            message.ack() # ACK because we've reported it. Prevents retry loops for unrecoverable callback errors.
+            message.ack()
         else:
-            # If we don't have enough info to report, NACK to allow Pub/Sub to retry or dead-letter.
             message.nack()
         logger_worker.info(
             f"CALLBACK_FINAL_STATE: For {current_object_name_for_log}. Message {'ACKed after reporting error' if batch_id_from_msg else 'NACKed'}. "
         )
 
 
-
 def _report_completion_to_api(
-    batch_id: str, 
-    file_id: str, 
-    original_file_name: str, 
-    success: bool, 
-    error_msg: Optional[str]
+    batch_id: Optional[str],
+    file_id: Optional[str],
+    original_file_name: Optional[str],
+    success: bool,
+    error_msg: Optional[str],
+    # +++ NEW OPTIONAL METRICS FROM WORKER +++
+    tables_created_count: Optional[int] = None,
+    total_rows_loaded: Optional[int] = None,
+    processing_duration_ms: Optional[int] = None
 ):
-    if not batch_id or not file_id or not original_file_name:
-        logger_worker.error(f"Cannot report completion for {original_file_name}: Missing tracking IDs.")
+    if not batch_id or not file_id:
+        logger_worker.error(f"Cannot report completion for {original_file_name or 'UnknownFile'}: Missing critical batch_id or file_id.")
         return
 
     report_url = f"{BASE_URL}/api/internal/etl-file-completed"
+    
     payload = {
         "batch_id": batch_id,
         "file_id": file_id,
-        "original_file_name": original_file_name,
+        "original_file_name": original_file_name or "N/A",
         "success": success,
-        "error_message": error_msg
+        "error_message": error_msg,
+        # +++ ADD NEW METRICS TO PAYLOAD +++
+        "tables_created_count": tables_created_count,
+        "total_rows_loaded": total_rows_loaded,
+        "processing_duration_ms_worker": processing_duration_ms, # Key matches Pydantic model in main.py
     }
-    # headers = {"X-Worker-API-Key": WORKER_INTERNAL_API_KEY} # If using API key
+    payload_cleaned = {k: v for k, v in payload.items() if v is not None}
+    
+    # headers = {}
+    # if WORKER_INTERNAL_API_KEY: # Define this if using API key auth
+    #     headers["X-Worker-API-Key"] = WORKER_INTERNAL_API_KEY
 
     try:
-        logger_worker.info(f"Reporting completion to API for FileID {file_id} in Batch {batch_id}. Success: {success}. Payload: {payload}")
-        response = requests.post(report_url, json=payload, timeout=20) # headers=headers
+        logger_worker.info(
+            f"Reporting completion to API for FileID {file_id} in Batch {batch_id}. "
+            f"Success: {success}. Payload: {payload_cleaned}"
+        )
+        response = requests.post(
+            report_url, 
+            json=payload_cleaned,
+            timeout=20
+            # headers=headers # Uncomment if using API key
+        )
         response.raise_for_status()
-        logger_worker.info(f"Successfully reported completion for FileID {file_id} to API. Status: {response.status_code}")
-    except requests.exceptions.RequestException as e:
-        logger_worker.error(f"Failed to report completion for FileID {file_id} to API: {e}", exc_info=True)
+        logger_worker.info(
+            f"Successfully reported completion for FileID {file_id} to API. "
+            f"Status: {response.status_code}"
+        )
+    except requests.exceptions.HTTPError as http_err:
+        logger_worker.error(
+            f"HTTP error reporting completion for FileID {file_id} to API: {http_err}. "
+            f"Response status: {http_err.response.status_code if http_err.response else 'N/A'}. Response text: {http_err.response.text[:500] if http_err.response else 'N/A'}"
+        )
+    except requests.exceptions.ConnectionError as conn_err:
+        logger_worker.error(f"Connection error reporting completion for FileID {file_id} to API: {conn_err}")
+    except requests.exceptions.Timeout as timeout_err:
+        logger_worker.error(f"Timeout error reporting completion for FileID {file_id} to API: {timeout_err}")
+    except requests.exceptions.RequestException as req_err:
+        logger_worker.error(f"Failed to report completion for FileID {file_id} to API: {req_err}", exc_info=True)
     except Exception as e_unexp:
         logger_worker.error(f"Unexpected error reporting completion for FileID {file_id}: {e_unexp}", exc_info=True)
-
 # Main execution block remains UNCHANGED
+
+
 if __name__ == "__main__":
     if not worker_subscriber or not WORKER_PUBSUB_SUBSCRIPTION:
         logger_worker.critical("Worker Pub/Sub subscriber client or subscription name is not configured. Exiting.")
